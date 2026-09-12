@@ -1629,11 +1629,22 @@ pub(crate) async fn run(
             return Ok(finish_run(&mut app));
         }
         // Fetch billing early so the welcome screen can show a credit warning.
-        if app.usage_visible {
+        if app.usage_visible
+            && matches!(
+                crate::app::codex_quota::allowance_provider(
+                    app.models.current.as_ref().map(|id| id.0.as_ref()),
+                ),
+                crate::app::codex_quota::AllowanceProvider::Xai
+            )
+        {
             let effs = vec![super::actions::Effect::FetchAppBilling];
             if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                 return Ok(finish_run(&mut app));
             }
+        }
+        let effs = crate::app::codex_quota::request_for_current(&mut app, false, 0);
+        if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+            return Ok(finish_run(&mut app));
         }
         // Fetch changelog off the render path so the welcome screen
         // can display bullets and /release-notes uses the cached result.
@@ -3488,6 +3499,10 @@ async fn drain_and_process(
                 // The user may have just subscribed in the browser and
                 // tabbed back.
                 let effs = app.fire_subscription_check("focus");
+                if process_effects(effs, tasks, app, progress_tx) {
+                    return true;
+                }
+                let effs = crate::app::codex_quota::request_for_current(app, false, 0);
                 if process_effects(effs, tasks, app, progress_tx) {
                     return true;
                 }

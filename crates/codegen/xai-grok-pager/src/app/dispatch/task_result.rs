@@ -330,6 +330,17 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             silent,
             nonce,
         } => {
+            let xai_model_is_current = app.agents.get(&agent_id).is_some_and(|agent| {
+                matches!(
+                    crate::app::codex_quota::allowance_provider(
+                        agent.session.models.current.as_ref().map(|id| id.0.as_ref()),
+                    ),
+                    crate::app::codex_quota::AllowanceProvider::Xai
+                )
+            });
+            if !xai_model_is_current {
+                return vec![];
+            }
             if let Some(agent) = app.agents.get_mut(&agent_id) {
                 if let Some(state) = usage_modal_state_mut(agent)
                     && state.fetch_nonce == nonce
@@ -347,7 +358,18 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
+        TaskResult::CodexQuotaFetched { target, response } => {
+            crate::app::codex_quota::handle_result(app, target, response)
+        }
         TaskResult::AppBillingFetched { balance, autotopup } => {
+            if !matches!(
+                crate::app::codex_quota::allowance_provider(
+                    app.models.current.as_ref().map(|id| id.0.as_ref()),
+                ),
+                crate::app::codex_quota::AllowanceProvider::Xai
+            ) {
+                return vec![];
+            }
             app.credit_balance = balance;
             apply_auto_topup(&mut app.auto_topup, &autotopup);
             vec![]
@@ -616,11 +638,22 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         }
         TaskResult::SwitchModelComplete {
             agent_id,
+            session_id,
+            generation,
             model_id,
             effort,
             result,
             prev_model_id,
-        } => handle_switch_model_complete(app, agent_id, model_id, effort, result, prev_model_id),
+        } => handle_switch_model_complete(
+            app,
+            agent_id,
+            session_id,
+            generation,
+            model_id,
+            effort,
+            result,
+            prev_model_id,
+        ),
         TaskResult::BgTaskKilled {
             session_id,
             task_id,
@@ -1490,8 +1523,15 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 post_action: true,
             }]
         }
+        TaskResult::LogoutOpenAiCodexComplete { message } => {
+            app.codex_quota = crate::app::codex_quota::CodexQuotaState::default();
+            for agent in app.agents.values_mut() {
+                agent.codex_quota = None;
+            }
+            app.show_toast(&message);
+            vec![]
+        }
         TaskResult::LogoutKimiComplete { message }
-        | TaskResult::LogoutOpenAiCodexComplete { message }
         | TaskResult::LogoutAnthropicClaudeComplete { message }
         | TaskResult::LogoutGitHubCopilotComplete { message }
         | TaskResult::LogoutRadiusComplete { message } => {
@@ -1499,6 +1539,10 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             vec![]
         }
         TaskResult::LogoutComplete => {
+            app.codex_quota = crate::app::codex_quota::CodexQuotaState::default();
+            for agent in app.agents.values_mut() {
+                agent.codex_quota = None;
+            }
             app.auth_state = AuthState::Pending { error: None };
             app.access_gate_shown_logged = false;
             app.announcement_cta_impressions_logged.clear();
@@ -1594,6 +1638,47 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let scrubbed = scrub_error_for_toast(&error);
             app.show_toast(&format!("\u{2717} Could not save {key}: {scrubbed}"));
             rollback_effects
+        }
+        TaskResult::DefaultModelPersisted {
+            agent_id,
+            session_id,
+            generation,
+            model_id,
+            rollback_model_id,
+            result,
+        } => {
+            let still_latest = app.agents.get(&agent_id).is_some_and(|agent| {
+                agent.session.session_id.as_ref() == Some(&session_id)
+                    && agent.session.model_switch_generation == generation
+                    && agent.session.models.current.as_ref() == Some(&model_id)
+            });
+            if !still_latest {
+                return vec![];
+            }
+            match result {
+                Ok(()) => {
+                    if app.models.available.contains_key(&model_id) {
+                        app.models.set_current(model_id.clone(), None);
+                    }
+                    let name = app.agents[&agent_id]
+                        .session
+                        .models
+                        .display_name_for(&model_id);
+                    app.show_toast(&format!("\u{2713} Default model: {name}"));
+                }
+                Err(error) => {
+                    if let Some(rollback) = rollback_model_id
+                        && app.models.available.contains_key(&rollback)
+                    {
+                        app.models.set_current(rollback, None);
+                    }
+                    let scrubbed = scrub_error_for_toast(&error);
+                    app.show_toast(&format!(
+                        "\u{2717} Could not save default_model: {scrubbed}"
+                    ));
+                }
+            }
+            vec![]
         }
         TaskResult::SettingPersistFailedBestEffort { key, error } => {
             tracing::warn!(

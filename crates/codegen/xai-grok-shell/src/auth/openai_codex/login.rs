@@ -23,8 +23,8 @@ use super::oauth::{
 use crate::auth::flow::AuthChannels;
 use crate::auth::model::GrokAuth;
 use crate::auth::storage::{
-    auth_json_path, read_openai_codex_auth, store_openai_codex_auth,
-    store_openai_codex_auth_after_refresh_locked,
+    auth_json_path, read_openai_codex_auth, read_openai_codex_auth_with_epoch,
+    store_openai_codex_auth, store_openai_codex_auth_after_refresh_locked,
 };
 
 /// How the user wants to authenticate (Pi `Select OpenAI Codex login method`).
@@ -591,7 +591,7 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
 
     let path = auth_json_path();
     let home = path.parent().unwrap_or(&path);
-    let auth = read_openai_codex_auth(home)?;
+    let (auth, auth_epoch) = read_openai_codex_auth_with_epoch(home)?;
     if !force && !crate::auth::is_expired(&auth) {
         return Some(auth);
     }
@@ -624,18 +624,22 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
                 "auth: Codex refresh lock timed out; waiting for sibling then adopting if possible"
             );
             tokio::time::sleep(CODEX_REFRESH_LOCK_TIMEOUT_WAIT).await;
-            return try_adopt_sibling_codex_token(home, &refresh, force).or_else(|| {
-                tracing::warn!(
-                    "auth: Codex refresh could not acquire lock and no sibling token to adopt"
-                );
-                None
-            });
+            return match inspect_codex_refresh_scope(home, &auth, auth_epoch.as_deref(), force) {
+                CodexRefreshDiskState::Adopt(adopted) => Some(adopted),
+                CodexRefreshDiskState::Refresh | CodexRefreshDiskState::Barrier => {
+                    tracing::warn!(
+                        "auth: Codex refresh could not acquire lock or durable scope was cleared"
+                    );
+                    None
+                }
+            };
         }
     };
 
-    // 2. Re-read under the lock — a sibling may have already rotated.
-    if let Some(adopted) = try_adopt_sibling_codex_token(home, &refresh, force) {
-        return Some(adopted);
+    // 2. Re-read under the lock — a sibling may have rotated, replaced, or
+    // deleted the scope while this operation waited.
+    if let Err(result) = adopt_or_stop_codex_refresh(home, &auth, auth_epoch.as_deref(), force) {
+        return result;
     }
 
     // 3. Re-validate that we still hold the *live* lock inode before the
@@ -653,13 +657,19 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
         .await
         {
             Some(relock) => {
-                if let Some(adopted) = try_adopt_sibling_codex_token(home, &refresh, force) {
-                    return Some(adopted);
+                if let Err(result) =
+                    adopt_or_stop_codex_refresh(home, &auth, auth_epoch.as_deref(), force)
+                {
+                    return result;
                 }
                 relock
             }
             None => {
-                return try_adopt_sibling_codex_token(home, &refresh, force);
+                return match inspect_codex_refresh_scope(home, &auth, auth_epoch.as_deref(), force)
+                {
+                    CodexRefreshDiskState::Adopt(adopted) => Some(adopted),
+                    CodexRefreshDiskState::Refresh | CodexRefreshDiskState::Barrier => None,
+                };
             }
         }
     };
@@ -680,8 +690,10 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
     } else {
         tracing::warn!("auth: Codex refresh lock lost during IdP call");
         drop(file_lock);
-        if let Some(adopted) = try_adopt_sibling_codex_token(home, &refresh, force) {
-            return Some(adopted);
+        if let Err(adopted_or_barrier) =
+            adopt_or_stop_codex_refresh(home, &auth, auth_epoch.as_deref(), force)
+        {
+            return adopted_or_barrier;
         }
         if result.is_err() {
             None
@@ -698,7 +710,9 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
                 Some(relock) => Some(relock),
                 None => {
                     tokio::time::sleep(CODEX_REFRESH_LOCK_TIMEOUT_WAIT).await;
-                    if let Some(adopted) = try_adopt_sibling_codex_token(home, &refresh, force) {
+                    if let CodexRefreshDiskState::Adopt(adopted) =
+                        inspect_codex_refresh_scope(home, &auth, auth_epoch.as_deref(), force)
+                    {
                         return Some(adopted);
                     }
                     tracing::warn!(
@@ -725,7 +739,11 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
                 // second flock here can self-block on non-reentrant platforms.
                 match file_lock.as_ref() {
                     Some(file_lock) => match store_openai_codex_auth_after_refresh_locked(
-                        home, &new_auth, &refresh, file_lock,
+                        home,
+                        &new_auth,
+                        &auth,
+                        auth_epoch.as_deref(),
+                        file_lock,
                     ) {
                         Ok(on_disk) => Some(on_disk),
                         Err(e) => {
@@ -760,44 +778,63 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
     out
 }
 
-/// After acquiring (or failing to acquire) the refresh lock, prefer a sibling's
-/// on-disk credential when it already supersedes the RT we were about to spend.
-///
-/// * RT changed → sibling rotated the family; always adopt when usable.
-/// * Same RT, not force, still valid → no network needed.
-/// * Same RT + force → do **not** adopt (401 recovery needs a new access token
-///   under the same RT; preferring the old access re-sends the rejected bearer).
-fn try_adopt_sibling_codex_token(
+#[derive(Debug)]
+enum CodexRefreshDiskState {
+    Adopt(GrokAuth),
+    Refresh,
+    Barrier,
+}
+
+/// Re-read the durable scope after lock acquisition. A missing scope is a
+/// completed logout, while a changed account or refresh-token family belongs
+/// to a sibling login/rotation and must never be overwritten.
+fn inspect_codex_refresh_scope(
     home: &std::path::Path,
-    spent_refresh: &str,
+    original: &GrokAuth,
+    original_epoch: Option<&str>,
     force: bool,
-) -> Option<GrokAuth> {
-    let existing = read_openai_codex_auth(home)?;
-    if existing.auth_mode != crate::auth::AuthMode::OpenAiCodex {
-        return None;
+) -> CodexRefreshDiskState {
+    let Some((existing, existing_epoch)) = read_openai_codex_auth_with_epoch(home) else {
+        return CodexRefreshDiskState::Barrier;
+    };
+    let original_account = original.account_id.as_deref().map(str::trim);
+    let existing_account = existing.account_id.as_deref().map(str::trim);
+    let existing_rt = existing.refresh_token.as_deref().unwrap_or("").trim();
+    let spent_refresh = original.refresh_token.as_deref().unwrap_or("").trim();
+    if existing_account != original_account
+        || existing_epoch.as_deref().map(str::trim) != original_epoch.map(str::trim)
+    {
+        return if !existing_rt.is_empty() || !crate::auth::is_expired(&existing) {
+            CodexRefreshDiskState::Adopt(existing)
+        } else {
+            CodexRefreshDiskState::Barrier
+        };
     }
-    let existing_rt = existing.refresh_token.as_deref().unwrap_or("");
     if existing_rt != spent_refresh {
-        // Sibling already rotated past the RT we held.
-        if !crate::auth::is_expired(&existing) {
-            tracing::info!("auth: Codex refresh adopted sibling token (RT rotated)");
-            return Some(existing);
-        }
-        // Sibling wrote an already-expired access under a new RT — still prefer
-        // their family over re-spending our dead RT.
         if !existing_rt.is_empty() {
-            tracing::info!(
-                "auth: Codex refresh adopted sibling RT family (access expired; will re-refresh later)"
-            );
-            return Some(existing);
+            tracing::info!("auth: Codex refresh adopted sibling RT family");
+            return CodexRefreshDiskState::Adopt(existing);
         }
-        return None;
+        return CodexRefreshDiskState::Barrier;
     }
     if !force && !crate::auth::is_expired(&existing) {
         tracing::debug!("auth: Codex refresh adopted unexpired disk token under lock");
-        return Some(existing);
+        return CodexRefreshDiskState::Adopt(existing);
     }
-    None
+    CodexRefreshDiskState::Refresh
+}
+
+fn adopt_or_stop_codex_refresh(
+    home: &std::path::Path,
+    original: &GrokAuth,
+    original_epoch: Option<&str>,
+    force: bool,
+) -> Result<(), Option<GrokAuth>> {
+    match inspect_codex_refresh_scope(home, original, original_epoch, force) {
+        CodexRefreshDiskState::Adopt(auth) => Err(Some(auth)),
+        CodexRefreshDiskState::Barrier => Err(None),
+        CodexRefreshDiskState::Refresh => Ok(()),
+    }
 }
 
 async fn ensure_openai_codex_auth_with_op_timeout() -> Option<GrokAuth> {
@@ -889,6 +926,7 @@ fn refresh_codex_token_on_side_thread() -> Option<GrokAuth> {
 mod tests {
     use super::*;
     use crate::auth::AuthMode;
+    use crate::auth::storage::read_openai_codex_auth_epoch;
     use chrono::{Duration, Utc};
 
     fn sample_codex(rt: &str, access: &str, expires_in_secs: i64) -> GrokAuth {
@@ -988,12 +1026,49 @@ mod tests {
     }
 
     #[test]
+    fn deleted_scope_is_a_refresh_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = sample_codex("rt-old", "access-old", -3600);
+        assert!(matches!(
+            inspect_codex_refresh_scope(dir.path(), &original, None, false),
+            CodexRefreshDiskState::Barrier
+        ));
+    }
+
+    #[test]
+    fn replacement_account_is_adopted_even_for_forced_401_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = sample_codex("rt-same", "access-old", 3600);
+        original.account_id = Some("account-old".into());
+        let mut replacement = sample_codex("rt-same", "access-new-account", 3600);
+        replacement.account_id = Some("account-new".into());
+        store_openai_codex_auth(dir.path(), &replacement).unwrap();
+
+        let CodexRefreshDiskState::Adopt(adopted) = inspect_codex_refresh_scope(
+            dir.path(),
+            &original,
+            read_openai_codex_auth_epoch(dir.path()).as_deref(),
+            true,
+        ) else {
+            panic!("account replacement must stop the old forced refresh");
+        };
+        assert_eq!(adopted.account_id.as_deref(), Some("account-new"));
+    }
+
+    #[test]
     fn adopt_sibling_when_rt_rotated() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         store_openai_codex_auth(home, &sample_codex("rt-new", "access-new", 3600)).unwrap();
-        let adopted = try_adopt_sibling_codex_token(home, "rt-old", false)
-            .expect("must adopt sibling with rotated RT");
+        let original = sample_codex("rt-old", "access-old", -3600);
+        let CodexRefreshDiskState::Adopt(adopted) = inspect_codex_refresh_scope(
+            home,
+            &original,
+            read_openai_codex_auth_epoch(home).as_deref(),
+            false,
+        ) else {
+            panic!("must adopt sibling with rotated RT");
+        };
         assert_eq!(adopted.key, "access-new");
         assert_eq!(adopted.refresh_token.as_deref(), Some("rt-new"));
     }
@@ -1003,8 +1078,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         store_openai_codex_auth(home, &sample_codex("rt-same", "access-ok", 3600)).unwrap();
-        let adopted = try_adopt_sibling_codex_token(home, "rt-same", false)
-            .expect("unexpired same-RT token should be adopted without network");
+        let original = sample_codex("rt-same", "access-old", -3600);
+        let CodexRefreshDiskState::Adopt(adopted) = inspect_codex_refresh_scope(
+            home,
+            &original,
+            read_openai_codex_auth_epoch(home).as_deref(),
+            false,
+        ) else {
+            panic!("unexpired same-RT token should be adopted without network");
+        };
         assert_eq!(adopted.key, "access-ok");
     }
 
@@ -1014,8 +1096,17 @@ mod tests {
         let home = dir.path();
         // Still-valid access under the RT we are about to force-refresh after 401.
         store_openai_codex_auth(home, &sample_codex("rt-same", "access-rejected", 3600)).unwrap();
+        let original = sample_codex("rt-same", "access-rejected", 3600);
         assert!(
-            try_adopt_sibling_codex_token(home, "rt-same", true).is_none(),
+            matches!(
+                inspect_codex_refresh_scope(
+                    home,
+                    &original,
+                    read_openai_codex_auth_epoch(home).as_deref(),
+                    true,
+                ),
+                CodexRefreshDiskState::Refresh
+            ),
             "force refresh must not re-use the rejected access token under the same RT"
         );
     }
@@ -1025,8 +1116,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         store_openai_codex_auth(home, &sample_codex("rt-new", "access-sibling", 3600)).unwrap();
-        let adopted = try_adopt_sibling_codex_token(home, "rt-old", true)
-            .expect("force path must still adopt a sibling's newer RT family");
+        let original = sample_codex("rt-old", "access-old", 3600);
+        let CodexRefreshDiskState::Adopt(adopted) = inspect_codex_refresh_scope(
+            home,
+            &original,
+            read_openai_codex_auth_epoch(home).as_deref(),
+            true,
+        ) else {
+            panic!("force path must still adopt a sibling's newer RT family");
+        };
         assert_eq!(adopted.refresh_token.as_deref(), Some("rt-new"));
     }
 }

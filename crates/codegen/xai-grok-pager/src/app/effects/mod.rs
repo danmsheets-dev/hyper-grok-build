@@ -1953,6 +1953,7 @@ pub(crate) fn execute(
         Effect::SwitchModel {
             agent_id,
             session_id,
+            generation,
             model_id,
             effort,
             prev_model_id,
@@ -1975,7 +1976,7 @@ pub(crate) fn execute(
                         );
                     }
                     let req = acp::SetSessionModelRequest::new(
-                            session_id,
+                            session_id.clone(),
                             model_id.clone(),
                         )
                         .meta(Some(meta));
@@ -1997,6 +1998,8 @@ pub(crate) fn execute(
                         });
                     TaskResult::SwitchModelComplete {
                         agent_id,
+                        session_id,
+                        generation,
                         model_id,
                         effort,
                         result,
@@ -2291,6 +2294,29 @@ pub(crate) fn execute(
                         }
                     }
                 });
+        }
+        Effect::PersistDefaultModel {
+            agent_id,
+            session_id,
+            generation,
+            model_id,
+            rollback_model_id,
+        } => {
+            tasks.spawn(async move {
+                let result = persist_setting(
+                    "default_model",
+                    crate::settings::SettingValue::String(model_id.0.to_string()),
+                )
+                .await;
+                TaskResult::DefaultModelPersisted {
+                    agent_id,
+                    session_id,
+                    generation,
+                    model_id,
+                    rollback_model_id,
+                    result,
+                }
+            });
         }
         Effect::Authenticate {
             request_seq,
@@ -4446,6 +4472,42 @@ pub(crate) fn execute(
                         nonce,
                     }
                 });
+        }
+        Effect::FetchCodexQuota { target } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let request = acp::ExtRequest::new(
+                    "x.ai/codex-usage",
+                    serde_json::value::to_raw_value(
+                        &xai_grok_shell::extensions::codex_usage::CodexUsageRequest::default(),
+                    )
+                    .expect("serialize codex usage params")
+                    .into(),
+                );
+                let response = match acp_send(request, &tx).await {
+                    Ok(response) => {
+                        let wrapper: serde_json::Value =
+                            serde_json::from_str(response.0.get()).unwrap_or_default();
+                        let result = wrapper.get("result").unwrap_or(&wrapper);
+                        serde_json::from_value::<
+                            xai_grok_shell::extensions::codex_usage::CodexUsageResponse,
+                        >(result.clone())
+                        .unwrap_or(xai_grok_shell::extensions::codex_usage::CodexUsageResponse::Transient {
+                            account_key: None,
+                            auth_generation: None,
+                            error: xai_grok_shell::extensions::codex_usage::CodexUsageError::InvalidResponse,
+                            stale_eligible: false,
+                        })
+                    }
+                    Err(_) => xai_grok_shell::extensions::codex_usage::CodexUsageResponse::Transient {
+                        account_key: None,
+                        auth_generation: None,
+                        error: xai_grok_shell::extensions::codex_usage::CodexUsageError::Network,
+                        stale_eligible: false,
+                    },
+                };
+                TaskResult::CodexQuotaFetched { target, response }
+            });
         }
         Effect::RefreshGate => {
             tasks

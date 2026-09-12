@@ -4,7 +4,7 @@ use super::setters::{
     pr13_effective_default, set_ask_user_question_timeout_enabled_inner, set_auto_dark_theme_inner,
     set_auto_light_theme_inner, set_auto_update_inner, set_collapsed_edit_blocks_inner,
     set_combine_queued_prompts_inner, set_compact_mode, set_compact_mode_inner,
-    set_confirm_before_rewind_inner, set_contextual_hint_inner, set_default_model_inner,
+    set_confirm_before_rewind_inner, set_contextual_hint_inner,
     set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
     set_fork_secondary_model_inner, set_group_tool_verbs_inner, set_hunk_tracker_mode_inner,
     set_invert_scroll_inner, set_keep_text_selection_inner, set_language_inner,
@@ -990,7 +990,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
     rollback_value: &crate::settings::SettingValue,
 ) -> Vec<Effect> {
     use crate::settings::SettingValue;
-    let mut companion_effects: Vec<Effect> = Vec::new();
+    let companion_effects: Vec<Effect> = Vec::new();
     match (key, rollback_value) {
         ("compact_mode", SettingValue::Bool(b)) => set_compact_mode_inner(app, *b),
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
@@ -1090,64 +1090,14 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
             // other rollback arms must not clobber it from the global canonical.
             sync_active_auto_flag(app);
         }
-        // default_model: best-effort rollback. If the prior model no
-        // longer resolves, leave optimistic value + log.
+        // A default-model disk failure never owns a live session switch.
+        // Reconcile only the next-session app default; the specialized result
+        // path handles operation ordering for applied model choices.
         ("default_model", SettingValue::String(s)) => {
-            if s.is_empty() {
-                tracing::warn!(
-                    target: "settings",
-                    key = "default_model",
-                    "rollback to empty string requested but no \
-                     'clear current model' API exists — leaving live \
-                     state at optimistic value (next session reload \
-                     will resolve via shell default-resolution chain)",
-                );
-            } else {
-                // Resolve the prior model ID back to a ModelId
-                // and call the typed inner. If resolution fails
-                // (catalog changed mid-flight), log + leave
-                // optimistic.
-                let (resolved, session_id) = if let ActiveView::Agent(aid) = app.active_view
-                    && let Some(agent) = app.agents.get(&aid)
-                {
-                    (
-                        agent.session.models.resolve_by_name_or_id(s),
-                        agent.session.session_id.clone(),
-                    )
-                } else {
-                    (None, None)
-                };
-                match resolved {
-                    Some(id) => {
-                        let _ = set_default_model_inner(app, &id);
-                        // Emit reverse SwitchModel so the ACP session
-                        // matches the rolled-back pager mirror.
-                        if let ActiveView::Agent(aid) = app.active_view
-                            && let Some(sid) = session_id
-                        {
-                            if let Some(agent) = app.agents.get_mut(&aid) {
-                                agent.session.model_switch_pending = true;
-                            }
-                            companion_effects.push(Effect::SwitchModel {
-                                agent_id: aid,
-                                session_id: sid,
-                                model_id: id,
-                                effort: None,
-                                prev_model_id: None,
-                            });
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            target: "settings",
-                            key = "default_model",
-                            value = %s,
-                            "rollback model id no longer resolves in catalog — \
-                             in-memory state stays at optimistic value; ACP session \
-                             may diverge from pager mirror until next setter dispatch",
-                        );
-                    }
-                }
+            if !s.is_empty()
+                && let Some(id) = app.models.resolve_by_name_or_id(s)
+            {
+                app.models.set_current(id, None);
             }
         }
         // max_thoughts_width: direct inner call.

@@ -261,8 +261,8 @@ fn set_default_model_allowed_when_agent_chat_kind() {
     );
     assert!(app.agents[&id].session.model_switch_pending);
 }
-/// `/model <name>` dispatches `SetDefaultModel` which routes
-/// through both `PersistSetting` and `SwitchModel`.
+/// `/model <name>` dispatches a bound switch; persistence begins only after
+/// the shell confirms the selected model.
 #[test]
 fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
     let mut app = test_app_with_agent();
@@ -281,24 +281,13 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
     let effects = dispatch(Action::SendPrompt("/model Grok 4.5".into()), &mut app);
     assert_eq!(
         effects.len(),
-        2,
-        "expected PersistSetting + SwitchModel effects, got {effects:?}",
+        1,
+        "expected one bound SwitchModel effect, got {effects:?}"
     );
     assert!(
-        matches!(
-            &effects[0],
-            Effect::PersistSetting {
-                key: "default_model",
-                ..
-            }
-        ),
-        "first effect must be PersistSetting(default_model), got {:?}",
+        matches!(&effects[0], Effect::SwitchModel { model_id: mid, .. } if mid == &model_id),
+        "expected SwitchModel(<resolved id>), got {:?}",
         effects[0],
-    );
-    assert!(
-        matches!(&effects[1], Effect::SwitchModel { model_id: mid, .. } if mid == &model_id),
-        "second effect must be SwitchModel(<resolved id>), got {:?}",
-        effects[1],
     );
     assert!(app.agents[&id].session.model_switch_pending);
 }
@@ -389,41 +378,20 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
     let id = AgentId(0);
     let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
     let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
-    dispatch(
-        Action::SwitchModel {
-            model_id: model_a.clone(),
-            effort: None,
-        },
-        &mut app,
-    );
+    let switch = begin_test_model_switch(&mut app, model_a.clone(), None);
     assert!(app.agents[&id].session.model_switch_pending);
     dispatch(
-        Action::TaskComplete(TaskResult::SwitchModelComplete {
-            agent_id: id,
-            model_id: model_a,
-            effort: None,
-            result: Ok(()),
-            prev_model_id: None,
-        }),
+        Action::TaskComplete(switch_completion(switch, Ok(()))),
         &mut app,
     );
     assert!(!app.agents[&id].session.model_switch_pending);
-    dispatch(
-        Action::SwitchModel {
-            model_id: model_b.clone(),
-            effort: None,
-        },
-        &mut app,
-    );
+    let switch = begin_test_model_switch(&mut app, model_b.clone(), None);
     assert!(app.agents[&id].session.model_switch_pending);
     dispatch(
-        Action::TaskComplete(TaskResult::SwitchModelComplete {
-            agent_id: id,
-            model_id: model_b,
-            effort: None,
-            result: Err(SwitchModelError::Other("network error".into())),
-            prev_model_id: None,
-        }),
+        Action::TaskComplete(switch_completion(
+            switch,
+            Err(SwitchModelError::Other("network error".into())),
+        )),
         &mut app,
     );
     assert!(!app.agents[&id].session.model_switch_pending);
@@ -1414,12 +1382,8 @@ fn clear_default_model_persists_but_keeps_live_current() {
         "clear_default_model must NOT mutate live agent.session.models.current",
     );
 }
-/// `Action::SetDefaultModel(<known id>)` resolves the
-/// id against the live catalog, mutates current, and emits both
-/// PersistSetting + SwitchModel effects. This is the
-/// dispatch-level analog of the slash-command's
-/// `slash_model_valid_dispatches_set_default_model_with_switch_and_persist`
-/// test.
+/// `Action::SetDefaultModel(<known id>)` resolves the id against the live
+/// catalog and emits one bound switch without mutating confirmed state.
 #[test]
 fn set_default_model_resolves_known_name() {
     use agent_client_protocol as acp;
@@ -1435,20 +1399,14 @@ fn set_default_model_resolves_known_name() {
         .models
         .available
         .insert(id.clone(), info);
+    let before = app.agents[&agent_id].session.models.current.clone();
     let effects = dispatch(Action::SetDefaultModel(id.clone()), &mut app);
-    assert_eq!(effects.len(), 2);
+    assert_eq!(effects.len(), 1);
     assert!(matches!(
         &effects[0],
-        Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(s),
-            .. } if s == "grok-4.5"
-    ));
-    assert!(matches!(
-        &effects[1],
         Effect::SwitchModel { model_id: mid, .. } if mid == &id
     ));
-    assert_eq!(app.agents[&agent_id].session.models.current, Some(id));
+    assert_eq!(app.agents[&agent_id].session.models.current, before);
 }
 /// Re-dispatching the same model
 /// id is idempotent — no PersistSetting, no SwitchModel, no
@@ -1905,6 +1863,10 @@ fn set_simple_mode_propagates_to_every_agent() {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

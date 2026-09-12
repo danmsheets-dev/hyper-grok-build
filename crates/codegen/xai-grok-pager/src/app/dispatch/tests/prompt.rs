@@ -2658,13 +2658,7 @@ fn switch_model_holds_prompt_until_complete() {
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
 
-    dispatch(
-        Action::SwitchModel {
-            model_id: model_id.clone(),
-            effort: None,
-        },
-        &mut app,
-    );
+    let switch = begin_test_model_switch(&mut app, model_id.clone(), None);
     assert!(app.agents[&id].session.model_switch_pending);
 
     let effects = dispatch(Action::SendPrompt("hello".into()), &mut app);
@@ -2675,13 +2669,7 @@ fn switch_model_holds_prompt_until_complete() {
     assert_eq!(app.agents[&id].session.queue_len(), 1);
 
     let effects = dispatch(
-        Action::TaskComplete(TaskResult::SwitchModelComplete {
-            agent_id: id,
-            model_id,
-            effort: None,
-            result: Ok(()),
-            prev_model_id: None,
-        }),
+        Action::TaskComplete(switch_completion(switch, Ok(()))),
         &mut app,
     );
     assert!(

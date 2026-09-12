@@ -1019,7 +1019,7 @@ impl AgentView {
     /// Restores the original prompt text that was stashed when the question
     /// view opened, so typed "additional context" doesn't leak into the
     /// main prompt. Also clears any stashed (tab-hidden) question view.
-    fn dismiss_question_view(&mut self) -> InputOutcome {
+    pub(crate) fn dismiss_question_view(&mut self) -> InputOutcome {
         let is_doctor_fix = self.question_view.as_ref().is_some_and(|qv| {
             matches!(
                 qv.local_kind,
@@ -1034,6 +1034,7 @@ impl AgentView {
             self.restore_card_prompt(qv.stashed_prompt);
         }
         self.cleanup_question_state();
+        self.promote_pending_model_switch_confirmation();
         InputOutcome::Changed
     }
     /// Retract an interaction modal (permission / question / plan-approval) that
@@ -1140,6 +1141,7 @@ impl AgentView {
         self.record_question_pause(&qv);
         self.restore_card_prompt(qv.stashed_prompt);
         self.cleanup_question_state();
+        self.promote_pending_model_switch_confirmation();
         if skipped {
             return InputOutcome::Changed;
         }
@@ -1193,6 +1195,7 @@ impl AgentView {
                     }
                     self.prompt.restore(qv.stashed_prompt);
                     self.cleanup_question_state();
+                    self.promote_pending_model_switch_confirmation();
                     return InputOutcome::Changed;
                 }
             }
@@ -1207,6 +1210,7 @@ impl AgentView {
             };
             self.prompt.restore(qv.stashed_prompt);
             self.cleanup_question_state();
+            self.promote_pending_model_switch_confirmation();
             return outcome;
         }
         let response = if skipped {
@@ -1217,6 +1221,7 @@ impl AgentView {
         qv.send_ext_response(response);
         self.prompt.restore(qv.stashed_prompt);
         self.cleanup_question_state();
+        self.promote_pending_model_switch_confirmation();
         let action = if skipped {
             "interview_skip"
         } else {
@@ -1254,6 +1259,63 @@ impl AgentView {
             None
         }
     }
+    fn promote_pending_model_switch_confirmation(&mut self) {
+        use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
+        use xai_grok_tools::implementations::grok_build::ask_user_question::{
+            Question, QuestionOption,
+        };
+        if self.question_view.is_some() {
+            return;
+        }
+        let Some(pending) = self.session.pending_model_switch_confirmation.take() else {
+            return;
+        };
+        if self.session.session_id.as_ref() != Some(&pending.session_id)
+            || self.session.model_switch_generation != pending.generation
+        {
+            return;
+        }
+        let question = Question {
+            question: format!(
+                "Switching to {} requires starting a new session. Continue?",
+                pending.model_name
+            ),
+            id: None,
+            options: vec![
+                QuestionOption {
+                    label: "Yes".into(),
+                    description: format!("Start a new session with {}", pending.model_name),
+                    preview: None,
+                    id: None,
+                },
+                QuestionOption {
+                    label: "No".into(),
+                    description: "Continue the current session".into(),
+                    preview: None,
+                    id: None,
+                },
+            ],
+            multi_select: Some(false),
+        };
+        let stashed = self.prompt.stash();
+        self.question_view = Some(
+            QuestionViewState::new(
+                format!("agent-type-mismatch-{}", uuid::Uuid::new_v4()),
+                vec![question],
+                stashed,
+            )
+            .with_local_kind(LocalQuestionKind::AgentTypeMismatch {
+                origin_agent_id: self.session.id,
+                origin_session_id: pending.session_id,
+                generation: pending.generation,
+                model_id: pending.model_id,
+                effort: pending.effort,
+            })
+            .with_no_freeform(),
+        );
+        self.prompt.set_text("");
+    }
+
     /// Clean up question-related visual state after the question view is
     /// dismissed (submit, cancel, or replacement).
     fn cleanup_question_state(&mut self) {
@@ -1366,6 +1428,10 @@ mod cancel_turn_mouse_tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                model_switch_generation: 0,
+                pending_model_switch: None,
+                queued_model_switch: None,
+                pending_model_switch_confirmation: None,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 bg_tasks: std::collections::BTreeMap::new(),

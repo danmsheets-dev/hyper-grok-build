@@ -174,6 +174,19 @@ impl PolicyParams {
         tool_kind: Option<ToolKind>,
         args: &serde_json::Value,
     ) -> Result<(), xai_tool_runtime::ToolError> {
+        self.enforce_dispatch_with(tool_name, tool_kind, args, false)
+    }
+
+    /// [`Self::enforce_dispatch`], with the added-line count behind
+    /// `max_diff_lines` bounded in time and memory when `bounded` is set, as it
+    /// must be for text from an untrusted client.
+    pub fn enforce_dispatch_with(
+        &self,
+        tool_name: &str,
+        tool_kind: Option<ToolKind>,
+        args: &serde_json::Value,
+        bounded: bool,
+    ) -> Result<(), xai_tool_runtime::ToolError> {
         if let Some(err) = &self.load_error {
             return Err(denied_error(tool_name, "policy_file", err));
         }
@@ -202,13 +215,15 @@ impl PolicyParams {
                 &format!("`{path}` — matched deny-path fragment `{frag}`"),
             ));
         }
-        if let Some(added) = dispatch_added_lines(args)
+        // Counting added lines diffs the arguments, so it runs only under a limit.
+        if self.max_diff_lines.is_some()
+            && let Some((added, exact)) = dispatch_added_lines(args, bounded)
             && let Some((added, max)) = self.diff_exceeds_limit(added)
         {
             return Err(denied_error(
                 tool_name,
                 "max_diff_lines",
-                &format!("edit adding {added} lines (limit {max})"),
+                &diff_limit_detail(added, max, exact),
             ));
         }
         Ok(())
@@ -233,9 +248,9 @@ impl PolicyParams {
             let needle = needle.strip_suffix('/').unwrap_or(&needle);
             if normalized.contains(&format!("/{needle}/"))
                 || normalized.ends_with(&format!("/{needle}"))
-                || normalized.split('/').any(|c| {
-                    c == needle || (needle.starts_with('.') && c.starts_with(needle) && c != needle)
-                })
+                || normalized
+                    .split('/')
+                    .any(|c| c == needle || (needle.starts_with('.') && c.starts_with(needle)))
             {
                 return Some(frag.to_owned());
             }
@@ -354,7 +369,8 @@ fn dispatch_path(args: &serde_json::Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-fn dispatch_added_lines(args: &serde_json::Value) -> Option<u64> {
+/// Lines the edit in `args` adds, and whether that count is exact.
+fn dispatch_added_lines(args: &serde_json::Value, bounded: bool) -> Option<(u64, bool)> {
     let new = args
         .get("new_string")
         .and_then(serde_json::Value::as_str)
@@ -364,7 +380,25 @@ fn dispatch_added_lines(args: &serde_json::Value) -> Option<u64> {
         .get("old_string")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    Some(crate::types::output::line_diff(old, new).0.max(0) as u64)
+    Some(if bounded {
+        let count = crate::types::output::line_diff_bounded(old, new);
+        (count.added.max(0) as u64, count.exact)
+    } else {
+        (
+            crate::types::output::line_diff(old, new).0.max(0) as u64,
+            true,
+        )
+    })
+}
+
+/// The detail of a `max_diff_lines` refusal. An inexact count can be higher
+/// than the lines the edit really adds, so the detail says so.
+pub fn diff_limit_detail(added: u64, max: u64, exact: bool) -> String {
+    if exact {
+        format!("edit adding {added} lines (limit {max})")
+    } else {
+        format!("edit adding up to {added} lines, too many to count exactly (limit {max})")
+    }
 }
 
 fn args_confirmed(args: &serde_json::Value) -> bool {

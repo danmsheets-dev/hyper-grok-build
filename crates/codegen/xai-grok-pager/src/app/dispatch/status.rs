@@ -54,17 +54,28 @@ pub(super) fn open_usage_info_modal(
     let redirect_url = app.usage_billing_redirect_url.clone();
     let tier = app.subscription_tier.clone();
     let show_resolved_model = app.show_resolved_model;
+    let cached_codex_quota = app.codex_quota.display.clone();
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
     let session_id = agent.session.session_id.clone();
+    let model_id = agent
+        .session
+        .models
+        .current
+        .as_ref()
+        .map(|id| id.0.as_ref());
+    let allowance_provider = crate::app::codex_quota::allowance_provider(model_id);
 
     if let Some(state) = usage_modal_state_mut(agent) {
         state.set_tab(tab);
         return vec![];
     }
 
-    let billing_reachable = usage_visible && !agent.chat_kind && redirect_url.is_none();
+    let billing_reachable = matches!(allowance_provider, crate::app::codex_quota::AllowanceProvider::Xai)
+        && usage_visible
+        && !agent.chat_kind
+        && redirect_url.is_none();
     let nonce = next_usage_fetch_nonce();
     let mut state = UsageInfoModalState::new(
         tab,
@@ -73,10 +84,14 @@ pub(super) fn open_usage_info_modal(
             usage_visible,
             chat_kind: agent.chat_kind,
             billing_redirect_url: redirect_url,
+            allowance_provider: allowance_provider.clone(),
             subscription_tier: tier,
         },
     );
     state.fetch_nonce = nonce;
+    if matches!(allowance_provider, crate::app::codex_quota::AllowanceProvider::Codex) {
+        state.codex_quota = cached_codex_quota;
+    }
 
     let mut effects = Vec::new();
     if let Some(session_id) = session_id {
@@ -109,6 +124,9 @@ pub(super) fn open_usage_info_modal(
     agent.active_modal = Some(ActiveModal::UsageInfo {
         state: Box::new(state),
     });
+    if matches!(allowance_provider, crate::app::codex_quota::AllowanceProvider::Codex) {
+        effects.extend(crate::app::codex_quota::request_for_current(app, true, nonce));
+    }
     effects
 }
 
@@ -295,18 +313,29 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
-    let session_id = {
-        let Some(agent) = app.agents.get_mut(&id) else {
+    let (session_id, provider) = {
+        let Some(agent) = app.agents.get(&id) else {
             return vec![];
         };
-        agent.session.session_id.clone()
+        (
+            agent.session.session_id.clone(),
+            crate::app::codex_quota::allowance_provider(
+                agent.session.models.current.as_ref().map(|id| id.0.as_ref()),
+            ),
+        )
     };
     match session_id {
-        Some(session_id) => vec![Effect::FetchSessionUsage {
-            agent_id: id,
-            session_id,
-            nonce: 0,
-        }],
+        Some(session_id) => {
+            let mut effects = vec![Effect::FetchSessionUsage {
+                agent_id: id,
+                session_id,
+                nonce: 0,
+            }];
+            if matches!(provider, crate::app::codex_quota::AllowanceProvider::Codex) {
+                effects.extend(crate::app::codex_quota::request_for_current(app, true, 0));
+            }
+            effects
+        }
         None => {
             if let Some(agent) = app.agents.get_mut(&id) {
                 push_and_page_flip(
@@ -365,6 +394,29 @@ pub(super) fn commit_session_usage_block(
 
 /// Consumer credit follow-up for `/usage` (redirect or non-silent billing fetch).
 pub(super) fn append_consumer_billing_surface(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
+    let provider = app
+        .agents
+        .get(&agent_id)
+        .map(|agent| {
+            crate::app::codex_quota::allowance_provider(
+                agent.session.models.current.as_ref().map(|id| id.0.as_ref()),
+            )
+        })
+        .unwrap_or_else(|| crate::app::codex_quota::AllowanceProvider::Unsupported("unknown provider".into()));
+    match provider {
+        crate::app::codex_quota::AllowanceProvider::Codex => {
+            return crate::app::codex_quota::request_for_current(app, true, 0);
+        }
+        crate::app::codex_quota::AllowanceProvider::Unsupported(provider) => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                agent.scrollback.push_block(RenderBlock::system(format!(
+                    "{provider} allowance\nUsage limits are unavailable for this provider."
+                )));
+            }
+            return vec![];
+        }
+        crate::app::codex_quota::AllowanceProvider::Xai => {}
+    }
     if !app.usage_visible {
         return vec![];
     }
@@ -394,13 +446,33 @@ pub(super) fn append_consumer_billing_surface(app: &mut AppView, agent_id: Agent
 
 /// `/usage manage` — open consumer billing. No-op when the surface is hidden.
 pub(super) fn dispatch_manage_billing(app: &mut AppView) -> Vec<Effect> {
-    if !app.usage_visible {
-        return vec![];
+    let model_id = match app.active_view {
+        ActiveView::Agent(id) => app
+            .agents
+            .get(&id)
+            .and_then(|agent| agent.session.models.current.as_ref()),
+        ActiveView::Welcome => app.models.current.as_ref(),
+        _ => None,
+    };
+    match crate::app::codex_quota::allowance_provider(model_id.map(|id| id.0.as_ref())) {
+        crate::app::codex_quota::AllowanceProvider::Codex => {
+            app.show_toast("Manage OpenAI Codex billing in your ChatGPT account.");
+            vec![]
+        }
+        crate::app::codex_quota::AllowanceProvider::Unsupported(provider) => {
+            app.show_toast(&format!("Billing management is unavailable for {provider}."));
+            vec![]
+        }
+        crate::app::codex_quota::AllowanceProvider::Xai => {
+            if !app.usage_visible {
+                return vec![];
+            }
+            super::router::dispatch(
+                crate::app::actions::Action::OpenUrl("https://grok.com/?_s=usage".to_string()),
+                app,
+            )
+        }
     }
-    super::router::dispatch(
-        crate::app::actions::Action::OpenUrl("https://grok.com/?_s=usage".to_string()),
-        app,
-    )
 }
 
 /// Commit a one-line "update available" notice into the active agent's

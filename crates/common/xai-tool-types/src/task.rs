@@ -490,19 +490,17 @@ impl SubagentCompletedOutput {
         if let Some(ref stat) = self.diffstat {
             text.push_str(&format!("\n\n<diffstat>{stat}</diffstat>"));
         }
-        if let Some(ref paths) = self.changed_paths {
-            if !paths.is_empty() {
-                text.push_str("\n\n<changed_paths>\n");
-                for p in paths.iter().take(15) {
-                    text.push_str("- ");
-                    text.push_str(p);
-                    text.push('\n');
-                }
-                if paths.len() > 15 {
-                    text.push_str(&format!("- … +{} more\n", paths.len() - 15));
-                }
-                text.push_str("</changed_paths>");
+        if let Some(ref paths) = self.changed_paths && !paths.is_empty() {
+            text.push_str("\n\n<changed_paths>\n");
+            for p in paths.iter().take(15) {
+                text.push_str("- ");
+                text.push_str(p);
+                text.push('\n');
             }
+            if paths.len() > 15 {
+                text.push_str(&format!("- … +{} more\n", paths.len() - 15));
+            }
+            text.push_str("</changed_paths>");
         }
         if let Some(ref seed) = self.worktree_seed {
             text.push_str(&format!("\n\n<worktree_seed>{seed}</worktree_seed>"));

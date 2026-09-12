@@ -651,7 +651,11 @@ pub struct WelcomeRenderParams<'a> {
     /// Live working directory (tracks `Effect::SetWorkingDir`), used to pin
     /// the current repo's session group to the top of the picker.
     pub cwd: &'a std::path::Path,
-    /// App-level credit balance for showing the usage warning on the welcome screen.
+    /// OpenAI Codex allowance for the selected welcome model.
+    pub codex_quota: Option<&'a crate::app::codex_quota::CodexQuotaDisplay>,
+    /// Canonical selected model used for provider routing.
+    pub model_id: Option<&'a str>,
+    /// App-level xAI credit balance for showing the usage warning on the welcome screen.
     pub credit_balance: Option<&'a crate::views::credit_bar::CreditBalance>,
     /// Auto top-up rule paired with `credit_balance` for the welcome warning.
     pub auto_topup: Option<&'a crate::views::credit_bar::AutoTopupInfo>,
@@ -2224,9 +2228,15 @@ fn render_welcome_done(
                 .render(tip_inset, buf);
         }
 
-        let warning = p.credit_balance.and_then(|bal| {
-            crate::views::credit_bar::usage_warning(bal, p.auto_topup, p.usage_visible)
-        });
+        let warning = match crate::app::codex_quota::allowance_provider(p.model_id) {
+            crate::app::codex_quota::AllowanceProvider::Codex => {
+                crate::app::codex_quota::warning(p.codex_quota)
+            }
+            crate::app::codex_quota::AllowanceProvider::Xai => p.credit_balance.and_then(|bal| {
+                crate::views::credit_bar::usage_warning(bal, p.auto_topup, p.usage_visible)
+            }),
+            crate::app::codex_quota::AllowanceProvider::Unsupported(_) => None,
+        };
         let (usage_warning_text, usage_warning_critical) = match warning {
             Some((text, critical)) => (Some(text), critical),
             None => (None, false),
@@ -2886,6 +2896,8 @@ mod tests {
             session_picker_pending_delete: false,
             chat_mode: false,
             cwd: std::path::Path::new("/repo"),
+            codex_quota: None,
+            model_id: None,
             credit_balance: None,
             auto_topup: None,
             usage_visible: true,

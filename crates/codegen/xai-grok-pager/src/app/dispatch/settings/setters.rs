@@ -1731,6 +1731,7 @@ pub(in crate::app::dispatch) fn preview_auto_light_theme(
 /// State-only mutation for `default_model`: set
 /// `agent.session.models.current` to the supplied id. Returns `true`
 /// if the catalog contains `id`; `false` otherwise.
+#[cfg(test)]
 pub(in crate::app::dispatch) fn set_default_model_inner(
     app: &mut AppView,
     id: &acp::ModelId,
@@ -1764,134 +1765,66 @@ pub(in crate::app::dispatch) fn set_default_model_inner(
     true
 }
 
-/// Toast format for `default_model`. Like the theme toasts, it
-/// renders the user-friendly model name (NOT the internal id) so the
-/// toast text matches what the user typed. Session-only providers
-/// (Codex subscription) drop the "Default" wording since nothing persists.
-fn save_default_model_toast(value: &str, session_only: bool) -> String {
-    if session_only {
-        format!("\u{2713} Model: {value}")
-    } else {
-        format!("\u{2713} Default model: {value}")
-    }
-}
-
-/// Outer dispatcher for `Action::SetDefaultModel`. Switches and persists
-/// and toasts. `PersistSetting` emitted first for consistent rollback;
-/// `SwitchModel` second. Idempotent: same model already active → no-op.
+/// Outer dispatcher for `Action::SetDefaultModel`. The live model remains at
+/// its last confirmed value until the serialized ACP request succeeds; only
+/// then is the non-Codex global default persisted.
 pub(in crate::app::dispatch) fn set_default_model(
     app: &mut AppView,
     new_id: acp::ModelId,
 ) -> Vec<Effect> {
     let ActiveView::Agent(aid) = app.active_view else {
-        tracing::error!(
-            target: "settings",
-            key = "default_model",
-            "Action::SetDefaultModel dispatched with no active agent — no-op",
-        );
+        tracing::error!(target: "settings", key = "default_model", "Action::SetDefaultModel dispatched with no active agent — no-op");
         return vec![];
     };
-
-    // Snapshot previous id + display name from the active agent's
-    // session (the same source `set_default_model_inner` mutates
-    // and the modal reads).
-    let (prev_id, session_id, available_has_new, new_display) = {
+    let (prev_id, session_id, available_has_new) = {
         let Some(agent) = app.agents.get(&aid) else {
-            tracing::error!(
-                target: "settings",
-                key = "default_model",
-                "Action::SetDefaultModel: active_view::Agent points to missing agent",
-            );
+            tracing::error!(target: "settings", key = "default_model", "Action::SetDefaultModel: active agent is missing");
             return vec![];
         };
-        let prev_id = agent.session.models.current.clone();
-        let session_id = agent.session.session_id.clone();
-        let available_has_new = agent.session.models.available.contains_key(&new_id);
-        let new_display = agent.session.models.display_name_for(&new_id);
-        (prev_id, session_id, available_has_new, new_display)
+        (
+            agent.session.models.current.clone(),
+            agent.session.session_id.clone(),
+            agent.session.models.available.contains_key(&new_id),
+        )
     };
-
     if !available_has_new {
-        tracing::error!(
-            target: "settings",
-            key = "default_model",
-            id = ?new_id,
-            "Action::SetDefaultModel dispatched with model id not in catalog — \
-             validator skew; no-op",
+        tracing::error!(target: "settings", key = "default_model", id = ?new_id, "unknown model id");
+        return vec![];
+    }
+    if prev_id.as_ref() == Some(&new_id) && app.agents[&aid].session.pending_model_switch.is_none()
+    {
+        return vec![];
+    }
+
+    let persist_as_default = !xai_grok_shell::agent::chat_modes::process_chat_mode_enabled()
+        && !crate::acp::router::is_codex_model(&new_id);
+    if let Some(session_id) = session_id {
+        let rollback = app.models.current.clone();
+        let agent = app.agents.get_mut(&aid).expect("active agent present");
+        return super::super::session::lifecycle::request_model_switch(
+            aid,
+            agent,
+            session_id,
+            new_id,
+            None,
+            persist_as_default,
+            rollback,
         );
-        return vec![];
     }
 
-    // Idempotent: same model already active → no-op.
-    if prev_id.as_ref() == Some(&new_id) {
-        return vec![];
-    }
-
-    let did_mutate = set_default_model_inner(app, &new_id);
-    debug_assert!(did_mutate, "available_has_new gate guarantees mutation");
-    refresh_open_settings_modals(app);
-    tracing::info!(
-        target: "settings",
-        key = "default_model",
-        new = ?new_display,
-        new_id = %new_id.0,
-        prev_id = ?prev_id.as_ref().map(|id| id.0.as_ref()),
-        "setting changed",
-    );
-    let is_codex = crate::acp::router::is_codex_model(&new_id);
-    app.show_toast(&save_default_model_toast(&new_display, is_codex));
-
-    // Persist the **model ID** (catalog key), not the display name.
-    // The shell's `resolve_default_model` matches by slug / map key,
-    // so persisting the human-readable name (e.g. "Grok Build")
-    // would silently fail to resolve on the next startup.
-    //
-    // Chat (`--chat` / GROK_CHAT_MODE) catalogs use opaque `/rest/modes`
-    // slugs that must not become the global Build `default_model`.
-    // Codex (`codex:*` and native `openai-codex/*`) ids are session-scoped
-    // subscription routes; they are not Grok catalog models and must never
-    // persist as `default_model` (that file is shared by every turbo window).
-    let mut effects: Vec<Effect> = Vec::new();
-    if !xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() && !is_codex {
-        let new_id_str = new_id.0.to_string();
-        let prev_id_str = prev_id
-            .as_ref()
-            .map(|id| id.0.to_string())
-            .unwrap_or_default();
-        effects.push(Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(new_id_str),
-            rollback_value: crate::settings::SettingValue::String(prev_id_str),
-        });
-    }
-
-    // Best-effort session-level switch. The `Effect::SwitchModel`
-    // pipeline handles its own deferred-switch semantics for the
-    // no-session-id-yet case (see line 583 of this file).
-    if let Some(sid) = session_id {
-        // We already hold a reference path to the agent above; re-borrow
-        // mutably here to flip `model_switch_pending`.
-        if let Some(agent) = app.agents.get_mut(&aid) {
-            agent.session.model_switch_pending = true;
-        }
-        effects.push(Effect::SwitchModel {
-            agent_id: aid,
-            session_id: sid,
-            model_id: new_id,
-            effort: None,
-            prev_model_id: prev_id.clone(),
-        });
-    } else if let Some(agent) = app.agents.get_mut(&aid) {
-        // No session id yet — stash for
-        // `EventLoop::on_session_created` to apply once the session
-        // id materialises. Mirrors `Action::SwitchModel` line 586.
+    if let Some(agent) = app.agents.get_mut(&aid) {
+        agent.session.models.set_current(new_id.clone(), None);
         agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
-            model_id: new_id,
+            model_id: new_id.clone(),
             effort: None,
             prev_model_id: prev_id,
         });
     }
-    effects
+    if persist_as_default && app.models.available.contains_key(&new_id) {
+        app.models.set_current(new_id, None);
+    }
+    refresh_open_settings_modals(app);
+    vec![]
 }
 
 /// Clear the default model override. Persists `[models].default = None`;

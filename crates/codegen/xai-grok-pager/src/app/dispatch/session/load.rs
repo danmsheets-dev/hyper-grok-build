@@ -196,6 +196,10 @@ fn dispatch_load_session_ungated(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -965,6 +969,10 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -1155,14 +1163,15 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             nonce: 0,
         });
         if let Some(switch) = deferred {
-            agent.session.model_switch_pending = true;
-            effects.push(Effect::SwitchModel {
+            effects.extend(super::lifecycle::request_model_switch(
                 agent_id,
-                session_id: hydrate_sid.clone(),
-                model_id: switch.model_id,
-                effort: switch.effort,
-                prev_model_id: switch.prev_model_id,
-            });
+                agent,
+                hydrate_sid.clone(),
+                switch.model_id,
+                switch.effort,
+                false,
+                None,
+            ));
         }
         if std::mem::take(&mut agent.pending_extensions_fetch)
             && let Some(modal) = agent.extensions_modal.as_mut()

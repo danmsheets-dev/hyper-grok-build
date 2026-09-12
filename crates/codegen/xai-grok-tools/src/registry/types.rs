@@ -1832,13 +1832,17 @@ impl FinalizedToolset {
         args: &serde_json::Value,
         cwd_override: Option<&std::path::Path>,
     ) -> Result<(), xai_tool_runtime::ToolError> {
-        let (injected, session_cwd) = {
+        let (injected, session_cwd, served) = {
             let res = self.resources.lock().await;
             let injected = res
                 .get::<Params<crate::implementations::grok_build::policy::PolicyParams>>()
                 .map(|p| p.0.clone());
             let session_cwd = res.get::<Cwd>().map(|c| c.0.clone());
-            (injected, session_cwd)
+            // A toolset served to an untrusted client bounds what its checks cost.
+            let served = res
+                .get::<crate::types::resources::ServedEditPolicy>()
+                .is_some();
+            (injected, session_cwd, served)
         };
         let cwd = cwd_override
             .map(std::path::Path::to_path_buf)
@@ -1848,7 +1852,7 @@ impl FinalizedToolset {
             cwd.as_deref(),
         );
         let kind = self.get_tool_metadata(tool_name).map(|m| m.kind());
-        policy.enforce_dispatch(tool_name, kind, args)
+        policy.enforce_dispatch_with(tool_name, kind, args, served)
     }
 
     /// Post-dispatch tail shared by [`call`] / [`call_streaming`].

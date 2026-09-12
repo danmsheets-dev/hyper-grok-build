@@ -1662,12 +1662,23 @@ pub(super) fn handle_prompt_response(
             });
         }
 
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-            nonce: 0,
-        });
+        let codex_allowance = matches!(
+            crate::app::codex_quota::allowance_provider(
+                agent.session.models.current.as_ref().map(|id| id.0.as_ref()),
+            ),
+            crate::app::codex_quota::AllowanceProvider::Codex
+        );
+        if !codex_allowance {
+            effects.push(Effect::FetchBilling {
+                agent_id,
+                silent: true,
+                nonce: 0,
+            });
+        }
         note_peek_page_flip(app, agent_id, page_flip_entry);
+        if codex_allowance {
+            effects.extend(crate::app::codex_quota::request_for_current(app, false, 0));
+        }
         return effects;
     }
     vec![]

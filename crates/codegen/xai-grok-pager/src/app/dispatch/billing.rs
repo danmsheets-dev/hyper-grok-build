@@ -375,6 +375,17 @@ pub(super) fn handle_billing_fetched(
     autotopup: crate::views::credit_bar::AutoTopupFetch,
     nonce: u64,
 ) -> Vec<Effect> {
+    let xai_model_is_current = app.agents.get(&agent_id).is_some_and(|agent| {
+        matches!(
+            crate::app::codex_quota::allowance_provider(
+                agent.session.models.current.as_ref().map(|id| id.0.as_ref()),
+            ),
+            crate::app::codex_quota::AllowanceProvider::Xai
+        )
+    });
+    if !xai_model_is_current {
+        return vec![];
+    }
     // Parse/transport failures route to `BillingError`, so a `None`
     // balance here means the response carried no billing config. Clear
     // the cached balance + polling so the status bar agrees with the

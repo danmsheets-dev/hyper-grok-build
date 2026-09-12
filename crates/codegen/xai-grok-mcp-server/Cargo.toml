@@ -1,0 +1,65 @@
+[package]
+name = "xai-grok-mcp-server"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "Serves Turbo's tool registry over MCP to external clients (ChatGPT Developer mode custom apps). Owns the path-containment boundary for that exposure."
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+# PKCE S256: the challenge is base64url(SHA-256(verifier)), and `ring` (already
+# here for the CSPRNG) has the digest but no base64.
+base64 = { workspace = true }
+dirs = { workspace = true }
+http-body-util = { workspace = true }
+# A hand-rolled HTTP/1 accept loop, for header-read timeouts and a connection
+# cap that `axum::serve` does not expose. Versions already in the lockfile.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+ring = { workspace = true }
+# `server` is already on via rmcp's default features; only the HTTP
+# transport is additive. Neither pulls reqwest, so the reqwest-0.13
+# quarantine that `xai-grok-mcp` exists for is not widened here.
+rmcp = { version = "2.1", features = ["transport-streamable-http-server"] }
+# File identity, to recognise a home directory under another spelling.
+same-file = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "net", "process", "io-util", "time", "fs"] }
+toml = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true }
+xai-grok-config = { workspace = true }
+xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
+xai-grok-tools = { workspace = true }
+xai-tty-utils = { workspace = true }
+
+# Owner-only DACL on the private session folder. The version the tree already
+# carries (via xai-grok-tools), so no new crate is compiled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
+] }
+
+# `fstatat` with `AT_NO_AUTOMOUNT`, so checking roots never mounts a home.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -872,6 +872,9 @@ pub enum Action {
         /// `true` = start a new session with the target model.
         /// `false` = cancel, return to current session.
         start_new: bool,
+        origin_agent_id: AgentId,
+        origin_session_id: acp::SessionId,
+        generation: u64,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
     },
@@ -1706,12 +1709,10 @@ pub enum Effect {
     SwitchModel {
         agent_id: AgentId,
         session_id: acp::SessionId,
+        generation: u64,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
-        /// The model that was active before the optimistic UI update
-        /// in `set_default_model`. `None` for `Action::SwitchModel`
-        /// (no optimistic update). Threaded through to
-        /// `SwitchModelComplete` so `IncompatibleAgent` can roll back.
+        /// Retained on the wire task for compatibility with typed shell errors.
         prev_model_id: Option<acp::ModelId>,
     },
     /// Fetch changelog from CDN (both markdown + structured JSON).
@@ -1758,6 +1759,15 @@ pub enum Effect {
         key: crate::settings::SettingKey,
         value: crate::settings::SettingValue,
         rollback_value: crate::settings::SettingValue,
+    },
+    /// Persist a confirmed non-Codex default model, bound to the switch that
+    /// produced it so late disk results cannot reconcile another session.
+    PersistDefaultModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        generation: u64,
+        model_id: acp::ModelId,
+        rollback_model_id: Option<acp::ModelId>,
     },
     /// Send structured prompt blocks to the agent.
     /// Used for skill injection where the prompt consists of
@@ -2227,6 +2237,10 @@ pub enum Effect {
         /// never touch the modal's loading/error flags).
         nonce: u64,
     },
+    /// Fetch OpenAI Codex subscription allowance through the shell extension.
+    FetchCodexQuota {
+        target: crate::app::codex_quota::CodexQuotaTarget,
+    },
     /// Fetch billing data at the app level (no agent required).
     /// Used on startup to populate the welcome-screen credit warning.
     FetchAppBilling,
@@ -2621,11 +2635,12 @@ pub enum TaskResult {
     /// Model switch completed (effort, if any, was applied in the same request).
     SwitchModelComplete {
         agent_id: AgentId,
+        session_id: acp::SessionId,
+        generation: u64,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
         result: Result<(), SwitchModelError>,
-        /// Forwarded from `Effect::SwitchModel.prev_model_id` for
-        /// rollback on `IncompatibleAgent`.
+        /// Forwarded from `Effect::SwitchModel.prev_model_id` for typed errors.
         prev_model_id: Option<acp::ModelId>,
     },
     /// Changelog fetched from CDN (both formats).
@@ -3041,6 +3056,11 @@ pub enum TaskResult {
         /// Usage-modal fetch generation (`0` = background refresh).
         nonce: u64,
     },
+    /// OpenAI Codex subscription allowance fetched.
+    CodexQuotaFetched {
+        target: crate::app::codex_quota::CodexQuotaTarget,
+        response: xai_grok_shell::extensions::codex_usage::CodexUsageResponse,
+    },
     /// App-level billing data (welcome screen).
     AppBillingFetched {
         balance: Option<crate::views::credit_bar::CreditBalance>,
@@ -3104,6 +3124,15 @@ pub enum TaskResult {
     SettingPersistFailedBestEffort {
         key: crate::settings::SettingKey,
         error: String,
+    },
+    /// Result of persisting a confirmed default-model selection.
+    DefaultModelPersisted {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        generation: u64,
+        model_id: acp::ModelId,
+        rollback_model_id: Option<acp::ModelId>,
+        result: Result<(), String>,
     },
     /// Off-thread clipboard attachment probe finished (see
     /// [`Effect::ProbeClipboardAttachment`]); dispatch attaches the chip.

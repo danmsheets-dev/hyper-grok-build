@@ -694,9 +694,32 @@ impl AgentState {
 pub struct DeferredModelSwitch {
     pub model_id: acp::ModelId,
     pub effort: Option<ReasoningEffort>,
-    /// Displayed model at stash time — the rollback target
-    /// (`Effect::SwitchModel.prev_model_id`) if the switch fails.
+    /// Displayed model at stash time — retained for compatibility with
+    /// deferred session creation; live switches do not optimistically mutate it.
     pub prev_model_id: Option<acp::ModelId>,
+}
+
+/// One serialized model switch bound to an ACP session incarnation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingModelSwitch {
+    pub generation: u64,
+    pub session_id: acp::SessionId,
+    pub model_id: acp::ModelId,
+    pub effort: Option<ReasoningEffort>,
+    pub confirmed_model_id: Option<acp::ModelId>,
+    pub confirmed_effort: Option<ReasoningEffort>,
+    pub persist_as_default: bool,
+    pub default_rollback_model_id: Option<acp::ModelId>,
+}
+
+/// Confirmation deferred on its owning agent until that agent is focused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingModelSwitchConfirmation {
+    pub generation: u64,
+    pub session_id: acp::SessionId,
+    pub model_id: acp::ModelId,
+    pub effort: Option<ReasoningEffort>,
+    pub model_name: String,
 }
 /// Per-agent business logic (ACP session, models, state).
 ///
@@ -785,12 +808,18 @@ pub struct AgentSession {
     /// `Some(_)` enables tool-gating in the slash registry; `None` keeps
     /// every command visible (avoids bootstrap flicker).
     pub available_tools: Option<HashSet<String>>,
-    /// Whether a `/model` switch is in flight. Dims the status-bar model name
-    /// and holds the queue drain (`maybe_drain_queue`) so a queued prompt isn't
-    /// sent on the old harness mid-switch. Cleared on
-    /// `SwitchModelComplete`, or by `begin_session_reload` when a reconnect
-    /// drops the in-flight RPC — else a lost completion jams the queue forever.
+    /// Whether a `/model` switch is in flight or queued. Dims the status-bar
+    /// model name and holds the prompt queue barrier until the latest request
+    /// resolves.
     pub model_switch_pending: bool,
+    /// Monotonic operation id for model selections in this agent slot.
+    pub model_switch_generation: u64,
+    /// The only model-switch RPC currently allowed on the wire.
+    pub pending_model_switch: Option<PendingModelSwitch>,
+    /// Latest selection made while the active RPC is in flight.
+    pub queued_model_switch: Option<PendingModelSwitch>,
+    /// Incompatible-agent confirmation waiting on its origin session.
+    pub pending_model_switch_confirmation: Option<PendingModelSwitchConfirmation>,
     /// Model the user chose this session via `/model` / the model picker, or
     /// the last successfully applied live remote `ModelChanged` (leader-mode
     /// fan-out). Survives reconnect (`begin_session_reload` does **not** clear
@@ -1189,6 +1218,10 @@ mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: BTreeMap::new(),

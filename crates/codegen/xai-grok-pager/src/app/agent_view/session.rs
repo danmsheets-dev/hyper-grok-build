@@ -35,6 +35,7 @@ impl AgentView {
     pub(crate) fn bind_session_id(&mut self, session_id: agent_client_protocol::SessionId) {
         if self.session.session_id.as_ref() != Some(&session_id) {
             self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
+            self.codex_quota = None;
             self.last_seen_event_id = None;
             self.last_applied_event_seq = None;
             self.last_applied_xai_event_seq = None;
@@ -46,6 +47,7 @@ impl AgentView {
     pub(crate) fn unbind_session_id(&mut self) {
         if self.session.session_id.take().is_some() {
             self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
+            self.codex_quota = None;
             self.clear_minimal_btw_lifecycle();
         }
     }
@@ -133,6 +135,7 @@ impl AgentView {
             workspace_mode: crate::views::welcome::WelcomeWorkspaceMode::Sandbox,
             #[cfg(feature = "local-workspace")]
             workspace_mode_cli_locked: false,
+            codex_quota: None,
             credit_balance: None,
             auto_topup: None,
             goal_state: None,
@@ -471,6 +474,9 @@ impl AgentView {
             self.scrollback.remove_entry(rid);
         }
         self.session.model_switch_pending = false;
+        self.session.pending_model_switch = None;
+        self.session.queued_model_switch = None;
+        self.session.pending_model_switch_confirmation = None;
         self.pending_adoption_updates.clear();
         let fresh = self.scrollback.fresh_continuation();
         self.session_reload = Some(SessionReload {

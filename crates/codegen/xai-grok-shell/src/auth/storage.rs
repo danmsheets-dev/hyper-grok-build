@@ -11,6 +11,8 @@ use super::model::{
     RADIUS_OAUTH_SCOPE, lookup_auth, platform_api_key_scope,
 };
 
+const OPENAI_CODEX_AUTH_EPOCH_SCOPE: &str = "meta/openai-codex/auth-epoch";
+
 /// RAII guard for an exclusive advisory lock on `auth.json.lock`.
 /// The lock is released when the inner `File` is dropped (closing the FD).
 ///
@@ -91,8 +93,26 @@ fn resolve_auth_json_path(grok_home: &Path) -> PathBuf {
     }
 }
 
+#[cfg(not(windows))]
+fn open_auth_file_for_read(auth_file: &Path) -> std::io::Result<File> {
+    File::open(auth_file)
+}
+
+#[cfg(windows)]
+fn open_auth_file_for_read(auth_file: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .open(auth_file)
+}
+
 pub fn read_auth_json(auth_file: &Path) -> std::io::Result<AuthStore> {
-    let mut file = File::open(auth_file)?;
+    let mut file = open_auth_file_for_read(auth_file)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
@@ -367,8 +387,58 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
 #[cfg(test)]
 pub(super) static WRITE_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Atomic write: tmp + rename. Unix `rename(2)` replaces atomically;
-/// Windows `rename` requires removing the target first.
+/// Atomically publish `tmp` over `target` without making the target absent.
+#[cfg(not(windows))]
+fn replace_auth_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, target)
+}
+
+/// `std::fs::rename` does not replace an existing file on Windows. Use the
+/// native replace flag instead of unlinking the old credential first.
+#[cfg(windows)]
+fn replace_auth_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    fn wide(path: &Path) -> std::io::Result<Vec<u16>> {
+        let path = std::path::absolute(path)?;
+        let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if value.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "auth path contains NUL",
+            ));
+        }
+        value.push(0);
+        Ok(value)
+    }
+
+    let from = wide(tmp)?;
+    let to = wide(target)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        match unsafe {
+            MoveFileExW(
+                PCWSTR(from.as_ptr()),
+                PCWSTR(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            Ok(()) => return Ok(()),
+            Err(error) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                let _ = error;
+            }
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+    }
+}
+
+/// Atomic write: serialize and sync a sibling temp file, then replace the old
+/// file in one filesystem publication step.
 fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
     #[cfg(test)]
     if WRITE_FAULT_PATH
@@ -411,11 +481,7 @@ fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::
     let mut tmp_reclaim = TmpReclaim(Some(&tmp));
 
     write_store_to(&tmp, auth_store)?;
-    #[cfg(windows)]
-    {
-        let _ = std::fs::remove_file(&write_path);
-    }
-    std::fs::rename(&tmp, &write_path)?;
+    replace_auth_file(&tmp, &write_path)?;
     tmp_reclaim.0 = None; // renamed into place; nothing to reclaim
     // Re-assert on the final path (covers rename edge cases / FS quirks).
     // Best-effort: rename already published the new tokens.
@@ -675,6 +741,37 @@ pub fn read_openai_codex_auth(grok_home: &Path) -> Option<GrokAuth> {
     (auth.auth_mode == AuthMode::OpenAiCodex).then_some(auth)
 }
 
+/// Read credentials and lifecycle identity from one atomically published document.
+pub(crate) fn read_openai_codex_auth_with_epoch(
+    grok_home: &Path,
+) -> Option<(GrokAuth, Option<String>)> {
+    let path = resolve_auth_json_path(grok_home);
+    let map = read_auth_json(&path).ok()?;
+    let auth = map.get(OPENAI_CODEX_OAUTH_SCOPE)?;
+    if auth.auth_mode != AuthMode::OpenAiCodex {
+        return None;
+    }
+    let epoch = codex_epoch_in_store(&map, auth);
+    Some((auth.clone(), epoch))
+}
+
+fn codex_epoch_in_store(map: &AuthStore, auth: &GrokAuth) -> Option<String> {
+    let epoch = map.get(OPENAI_CODEX_AUTH_EPOCH_SCOPE)?;
+    if epoch.auth_mode != AuthMode::OpenAiCodex
+        || auth.account_id.as_deref().map(str::trim) != epoch.account_id.as_deref().map(str::trim)
+    {
+        return None;
+    }
+    let value = epoch.key.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Read the non-secret lifecycle identity paired with the current Codex scope.
+#[cfg(test)]
+pub(crate) fn read_openai_codex_auth_epoch(grok_home: &Path) -> Option<String> {
+    read_openai_codex_auth_with_epoch(grok_home)?.1
+}
+
 /// Persist an OpenAI Codex OAuth credential under [`OPENAI_CODEX_OAUTH_SCOPE`].
 /// Merges with existing scopes so xAI login is preserved.
 ///
@@ -686,7 +783,16 @@ pub fn store_openai_codex_auth(grok_home: &Path, auth: &GrokAuth) -> std::io::Re
         let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
         let mut stored = auth.clone();
         stored.auth_mode = AuthMode::OpenAiCodex;
-        map.insert(OPENAI_CODEX_OAUTH_SCOPE.to_owned(), stored);
+        map.insert(OPENAI_CODEX_OAUTH_SCOPE.to_owned(), stored.clone());
+        map.insert(
+            OPENAI_CODEX_AUTH_EPOCH_SCOPE.to_owned(),
+            GrokAuth {
+                key: uuid::Uuid::new_v4().to_string(),
+                auth_mode: AuthMode::OpenAiCodex,
+                account_id: stored.account_id,
+                ..Default::default()
+            },
+        );
         write_auth_json(&path, &map)
     })
 }
@@ -703,22 +809,60 @@ pub fn store_openai_codex_auth(grok_home: &Path, auth: &GrokAuth) -> std::io::Re
 pub(crate) fn store_openai_codex_auth_after_refresh_locked(
     grok_home: &Path,
     candidate: &GrokAuth,
-    spent_refresh: &str,
+    original: &GrokAuth,
+    original_epoch: Option<&str>,
     file_lock: &AuthFileLock,
 ) -> std::io::Result<GrokAuth> {
     let path = resolve_auth_json_path(grok_home);
     ensure_live_auth_file_lock(file_lock, &path)?;
-    let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
-    let (stored, wrote) = adopt_or_prepare_refreshed_scope(
-        &mut map,
-        OPENAI_CODEX_OAUTH_SCOPE,
-        AuthMode::OpenAiCodex,
-        candidate,
-        spent_refresh,
-    );
-    if wrote {
-        write_auth_json(&path, &map)?;
+    let mut map = read_auth_json(&path)?;
+    let existing = map
+        .get(OPENAI_CODEX_OAUTH_SCOPE)
+        .filter(|auth| auth.auth_mode == AuthMode::OpenAiCodex)
+        .cloned()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "OpenAI Codex auth scope was deleted during refresh",
+            )
+        })?;
+
+    let original_account = original.account_id.as_deref().map(str::trim);
+    let existing_account = existing.account_id.as_deref().map(str::trim);
+    if existing_account != original_account {
+        return Ok(existing);
     }
+    let existing_epoch = codex_epoch_in_store(&map, &existing);
+    if existing_epoch.as_deref() != original_epoch.map(str::trim) {
+        return if existing_epoch.is_some() {
+            Ok(existing)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "OpenAI Codex auth lifecycle changed during refresh",
+            ))
+        };
+    }
+
+    let spent_refresh = original.refresh_token.as_deref().unwrap_or("").trim();
+    let existing_refresh = existing.refresh_token.as_deref().unwrap_or("").trim();
+    if !existing_refresh.is_empty() && existing_refresh != spent_refresh {
+        return Ok(existing);
+    }
+
+    if let Some(original_account) = original_account
+        && candidate.account_id.as_deref().map(str::trim) != Some(original_account)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refreshed OpenAI Codex credential changed account family",
+        ));
+    }
+
+    let mut stored = candidate.clone();
+    stored.auth_mode = AuthMode::OpenAiCodex;
+    map.insert(OPENAI_CODEX_OAUTH_SCOPE.to_owned(), stored.clone());
+    write_auth_json(&path, &map)?;
     Ok(stored)
 }
 
@@ -726,7 +870,10 @@ pub(crate) fn store_openai_codex_auth_after_refresh_locked(
 pub fn clear_openai_codex_auth(grok_home: &Path) -> std::io::Result<()> {
     let path = resolve_auth_json_path(grok_home);
     with_auth_json_scope_lock(&path, || {
-        clear_scope_from_auth_json(&path, OPENAI_CODEX_OAUTH_SCOPE)
+        clear_scopes_from_auth_json(
+            &path,
+            [OPENAI_CODEX_OAUTH_SCOPE, OPENAI_CODEX_AUTH_EPOCH_SCOPE],
+        )
     })
 }
 
@@ -1579,6 +1726,105 @@ mod scope_lock_tests {
 
     #[test]
     #[serial]
+    fn codex_auth_pair_keeps_epoch_with_its_document_and_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::unset("GROK_AUTH_PATH");
+        let path = dir.path().join("auth.json");
+        let auth = GrokAuth {
+            key: "paired-access".into(),
+            auth_mode: AuthMode::OpenAiCodex,
+            account_id: Some("paired-account".into()),
+            ..Default::default()
+        };
+        let mut map = AuthStore::new();
+        map.insert(OPENAI_CODEX_OAUTH_SCOPE.into(), auth.clone());
+        write_auth_json(&path, &map).unwrap();
+        let (read, epoch) = read_openai_codex_auth_with_epoch(dir.path()).unwrap();
+        assert_eq!(read.key, auth.key);
+        assert!(epoch.is_none(), "legacy credentials do not invent an epoch");
+
+        map.insert(
+            OPENAI_CODEX_AUTH_EPOCH_SCOPE.into(),
+            GrokAuth {
+                key: "paired-epoch".into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                account_id: auth.account_id.clone(),
+                ..Default::default()
+            },
+        );
+        write_auth_json(&path, &map).unwrap();
+        let (read, epoch) = read_openai_codex_auth_with_epoch(dir.path()).unwrap();
+        assert_eq!(read.account_id, auth.account_id);
+        assert_eq!(epoch.as_deref(), Some("paired-epoch"));
+
+        map.get_mut(OPENAI_CODEX_AUTH_EPOCH_SCOPE)
+            .unwrap()
+            .account_id = Some("other-account".into());
+        write_auth_json(&path, &map).unwrap();
+        assert!(
+            read_openai_codex_auth_with_epoch(dir.path())
+                .unwrap()
+                .1
+                .is_none()
+        );
+        map.remove(OPENAI_CODEX_OAUTH_SCOPE);
+        write_auth_json(&path, &map).unwrap();
+        assert!(read_openai_codex_auth_with_epoch(dir.path()).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn codex_refresh_cannot_recreate_scope_deleted_while_waiting_for_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::unset("GROK_AUTH_PATH");
+        let auth_path = dir.path().join("auth.json");
+        let lock_path = dir.path().join("auth.json.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        file.lock_exclusive().unwrap();
+        let file_lock = AuthFileLock {
+            _heartbeat: None,
+            _file: file,
+        };
+        let candidate = GrokAuth {
+            key: "late-access".to_string(),
+            refresh_token: Some("late-refresh".to_string()),
+            auth_mode: AuthMode::OpenAiCodex,
+            account_id: Some("acct".into()),
+            ..Default::default()
+        };
+
+        let original = GrokAuth {
+            key: "old-access".to_string(),
+            refresh_token: Some("spent-refresh".to_string()),
+            auth_mode: AuthMode::OpenAiCodex,
+            account_id: Some("acct".into()),
+            ..Default::default()
+        };
+        let error = store_openai_codex_auth_after_refresh_locked(
+            dir.path(),
+            &candidate,
+            &original,
+            None,
+            &file_lock,
+        )
+        .expect_err("logout deletion must be a durable barrier");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(read_openai_codex_auth(dir.path()).is_none());
+        assert!(
+            !auth_path.exists(),
+            "late refresh must not recreate auth.json"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn codex_after_refresh_adopts_rotated_sibling_not_stale_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::unset("GROK_AUTH_PATH");
@@ -1606,6 +1852,15 @@ mod scope_lock_tests {
         };
         let mut map = AuthStore::new();
         map.insert(OPENAI_CODEX_OAUTH_SCOPE.to_string(), sibling);
+        map.insert(
+            OPENAI_CODEX_AUTH_EPOCH_SCOPE.to_string(),
+            GrokAuth {
+                key: "test-login-epoch".into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                account_id: Some("acct".into()),
+                ..Default::default()
+            },
+        );
         write_auth_json(&auth_path, &map).unwrap();
 
         let candidate = GrokAuth {
@@ -1616,15 +1871,29 @@ mod scope_lock_tests {
             account_id: Some("acct".into()),
             ..Default::default()
         };
+        let original = GrokAuth {
+            key: "original-access".to_string(),
+            refresh_token: Some("rt-spent".to_string()),
+            auth_mode: AuthMode::OpenAiCodex,
+            account_id: Some("acct".into()),
+            ..Default::default()
+        };
+        let epoch_before = read_openai_codex_auth_epoch(dir.path()).unwrap();
         let stored = store_openai_codex_auth_after_refresh_locked(
             dir.path(),
             &candidate,
-            "rt-spent",
+            &original,
+            Some(&epoch_before),
             &file_lock,
         )
         .unwrap();
         assert_eq!(stored.key, "sibling-access");
         assert_eq!(stored.refresh_token.as_deref(), Some("rt-new"));
+        assert_eq!(
+            read_openai_codex_auth_epoch(dir.path()).as_deref(),
+            Some(epoch_before.as_str()),
+            "ordinary refresh/adoption must preserve login lifecycle identity",
+        );
         assert_eq!(
             read_openai_codex_auth(dir.path()).map(|a| a.key),
             Some("sibling-access".to_string())
@@ -2026,6 +2295,7 @@ mod grok_auth_path_tests {
             refresh_token: Some("codex-refresh".to_owned()),
             auth_mode: AuthMode::OpenAiCodex,
             email: Some("user@example.com".to_owned()),
+            account_id: Some("account-one".to_owned()),
             ..Default::default()
         };
         store_openai_codex_auth(home, &auth).unwrap();
@@ -2033,7 +2303,21 @@ mod grok_auth_path_tests {
         let loaded = read_openai_codex_auth(home).expect("token should be on GROK_AUTH_PATH");
         assert_eq!(loaded.key, "codex-access-token");
         assert_eq!(loaded.refresh_token.as_deref(), Some("codex-refresh"));
-        assert!(auth_file.is_file(), "credential written to GROK_AUTH_PATH");
+        let first_epoch = read_openai_codex_auth_epoch(home).expect("login epoch");
+        assert!(!first_epoch.is_empty());
+        store_openai_codex_auth(home, &auth).unwrap();
+        let second_epoch = read_openai_codex_auth_epoch(home).expect("replacement epoch");
+        assert_ne!(
+            first_epoch, second_epoch,
+            "re-login must rotate lifecycle identity"
+        );
+        clear_openai_codex_auth(home).unwrap();
+        assert!(read_openai_codex_auth(home).is_none());
+        assert!(read_openai_codex_auth_epoch(home).is_none());
+        assert!(
+            !auth_file.exists(),
+            "logout removes auth and lifecycle metadata"
+        );
         // Default ~/.grok/auth.json must not have been touched by this write path.
         // (We cannot assert absence of the real home file; only that our scratch exists.)
     }
@@ -2183,6 +2467,52 @@ mod write_fallback_tests {
         let err = write_auth_json_with(&path, &sample_store(), fake_permission_denied).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!path.exists(), "non-ENOSPC failure must not write the file");
+    }
+
+    #[test]
+    fn failed_atomic_replacement_keeps_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth_json(&path, &sample_store()).unwrap();
+
+        let mut replacement = sample_store();
+        replacement.get_mut(API_KEY_SCOPE).unwrap().key = "replacement-key".into();
+        *WRITE_FAULT_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
+        let error = write_auth_json_atomic(&path, &replacement).unwrap_err();
+        *WRITE_FAULT_PATH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(read_key(&path).as_deref(), Some("secret-key"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replacement_is_never_missing_to_independent_reader() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth_json(&path, &sample_store()).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_done = done.clone();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0usize;
+            while !reader_done.load(AtomicOrdering::Acquire) {
+                read_auth_json(&reader_path).expect("published auth file must always be readable");
+                reads += 1;
+            }
+            reads
+        });
+
+        for index in 0..100 {
+            let mut replacement = sample_store();
+            replacement.get_mut(API_KEY_SCOPE).unwrap().key = format!("key-{index}");
+            write_auth_json(&path, &replacement).unwrap();
+        }
+        done.store(true, AtomicOrdering::Release);
+        assert!(reader.join().unwrap() > 0);
     }
 
     /// The normal (real atomic) path still works end to end.

@@ -29,6 +29,7 @@ pub mod input;
 pub mod input_log;
 pub mod issues_cmd;
 pub mod mcp_cmd;
+pub mod mcp_serve_cmd;
 pub mod memory_cmd;
 pub mod memory_release;
 pub mod memory_trace;

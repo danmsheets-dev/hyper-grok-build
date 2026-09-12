@@ -125,6 +125,9 @@ pub enum LocalQuestionKind {
     /// type incompatibility. Carries the target model + effort so the
     /// answer handler can create a new session with it.
     AgentTypeMismatch {
+        origin_agent_id: crate::app::agent::AgentId,
+        origin_session_id: agent_client_protocol::SessionId,
+        generation: u64,
         model_id: agent_client_protocol::ModelId,
         effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
     },

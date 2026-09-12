@@ -751,6 +751,8 @@ pub struct AppView {
     /// `event_loop::run` from `connection.leader_status_rx.is_some()`;
     /// defaults to `false` (non-leader, dashboard hidden).
     pub leader_mode: bool,
+    /// OpenAI Codex allowance cache, request sequencing, and welcome presentation.
+    pub codex_quota: crate::app::codex_quota::CodexQuotaState,
     /// App-level credit balance used to show the usage warning on the
     /// welcome screen before any agent session exists.
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
@@ -1658,6 +1660,7 @@ impl AppView {
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
             leader_mode: false,
+            codex_quota: crate::app::codex_quota::CodexQuotaState::default(),
             credit_balance: None,
             auto_topup: None,
             billing_poll_wanted: false,
@@ -4824,6 +4827,8 @@ impl AppView {
                                 .session_picker_pending_delete
                                 .is_some(),
                             chat_mode: self.chat_mode,
+                            codex_quota: self.codex_quota.display.as_ref(),
+                            model_id: self.models.current.as_ref().map(|id| id.0.as_ref()),
                             credit_balance: self.credit_balance.as_ref(),
                             auto_topup: self.auto_topup.as_ref(),
                             usage_visible: self.usage_visible,
@@ -6518,6 +6523,7 @@ pub(crate) mod tests {
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
             leader_mode: true,
+            codex_quota: crate::app::codex_quota::CodexQuotaState::default(),
             credit_balance: None,
             auto_topup: None,
             billing_poll_wanted: false,
@@ -6578,6 +6584,10 @@ pub(crate) mod tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                model_switch_generation: 0,
+                pending_model_switch: None,
+                queued_model_switch: None,
+                pending_model_switch_confirmation: None,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 bg_tasks: std::collections::BTreeMap::new(),
@@ -6771,6 +6781,10 @@ pub(crate) mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

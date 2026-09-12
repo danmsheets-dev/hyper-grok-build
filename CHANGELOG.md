@@ -52,6 +52,62 @@ Older release notes (r1–r13 detail) are archived under
 
 ---
 
+## [1.0.13-rc.4] - 2026-09-12
+
+### Added
+- **`turbo mcp serve` — Turbo as an MCP server.** Serves a bounded subset of
+  Turbo's own file tools to an outside client over Streamable HTTP, bound to
+  loopback behind a random path segment and a bearer token that both change on
+  every start. `--root` is required and repeatable (the server never adopts the
+  current directory on its own); `--allow` defaults to `readonly`, and `edit` is
+  for a client trusted to change your code. `--tunnel cloudflare` puts a public
+  HTTPS edge in front. Every call still passes the same path boundary, in the
+  tier the operator started, inside the roots they approved.
+- **OAuth 2.1 for clients that cannot send a pasted bearer header** — ChatGPT
+  Developer mode among them. RFC 9728 protected-resource metadata, RFC 8414
+  authorization-server metadata, RFC 7591 dynamic client registration, PKCE
+  (`S256` only; `plain` refused), exact redirect-URI matching, and RFC 8707
+  audience-bound tokens. Consent binds to the console: Turbo prints an approval
+  code that the browser must return, so reaching the approval page is not enough
+  to obtain a token. Clients that *can* send their own header keep working
+  unchanged. **Not yet exercised against a live ChatGPT connector** — see the
+  status note in the README.
+
+### Fixed
+- **Consent could never be granted on a server that had been running five
+  minutes.** The approval window was measured from process start rather than
+  from the moment the approval page is served, so under `--tunnel cloudflare` it
+  often closed before the code was even printed, and afterwards no correct code
+  could be accepted — the only recovery was a restart that re-rolled every other
+  credential. The window now opens when the page is served, and reopens each
+  time it is served again.
+- **The `401` challenge and the printed `OAuth:` line named loopback behind a
+  tunnel,** so a remote client's discovery step resolved to its own host. Both
+  are now derived from the live resource instead of a bind-time snapshot.
+- **The OAuth routes had no body-read timeout.** They are merged after the
+  timeout layer, and `axum` does not apply a router's layers to merged routes,
+  so connections that sent a `Content-Length` they never satisfied could hold
+  every connection slot for the life of the process — taking the existing bearer
+  path down with them, since both share the budget. The timeout is now layered
+  on the OAuth router itself.
+- **32 unauthenticated registrations could lock out the operator's own connector**
+  for the life of the process. The oldest registration with no live grant is now
+  evicted to make room instead of refusing the newcomer.
+- Access tokens are now refused past the hour their `expires_in` advertises
+  (previously honoured for 14 days); `state` is percent-encoded into the
+  redirect rather than interpolated; `userinfo` in a loopback redirect URI is
+  refused; the consent page ships frame-busting, referrer and no-store headers
+  with both displayed values bounded and stripped of bidi controls; spent
+  refresh tokens are expired and cleared on rebind; and OAuth refusals now reach
+  the operator through the same throttled line as a bad bearer token.
+- **`clippy::collapsible_if`** in `xai-tool-types`, `xai-grok-tools/build.rs`
+  (two sites) and `xai-grok-config/shell.rs` (two sites), plus a needless borrow
+  and a redundant `trim()` before `split_whitespace()` in `xai-grok-config`.
+  `FileIdentity::from_metadata` is gated `#[cfg(not(windows))]` to match its
+  call sites, rather than allowed or deleted — it is live on every other target.
+
+---
+
 ## [1.0.13-rc.3] - 2026-09-05
 
 ### Fixed

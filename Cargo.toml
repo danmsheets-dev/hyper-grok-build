@@ -38,6 +38,7 @@ members = [
     "crates/codegen/xai-grok-markdown",
     "crates/codegen/xai-grok-markdown-core",
     "crates/codegen/xai-grok-mcp",
+    "crates/codegen/xai-grok-mcp-server",
     "crates/codegen/xai-grok-meeting-bot",
     "crates/codegen/xai-grok-meetings",
     "crates/codegen/xai-grok-memory",
@@ -153,6 +154,7 @@ documented = "0.9"
 # Bounded async channel for the live media input/playback queues (OMP port).
 flume = "0.11"
 dunce = "1"
+subtle = "2"
 educe = "0.6.0"
 encoding_rs = "0.8.35"
 enum_delegate = "0.2"
@@ -336,6 +338,7 @@ xai-grok-http = { path = "crates/codegen/xai-grok-http" }
 xai-grok-markdown = { path = "crates/codegen/xai-grok-markdown" }
 xai-grok-markdown-core = { path = "crates/codegen/xai-grok-markdown-core" }
 xai-grok-mcp = { path = "crates/codegen/xai-grok-mcp" }
+xai-grok-mcp-server = { path = "crates/codegen/xai-grok-mcp-server" }
 xai-grok-meeting-bot = { path = "crates/codegen/xai-grok-meeting-bot" }
 xai-grok-meetings = { path = "crates/codegen/xai-grok-meetings" }
 xai-grok-memory = { path = "crates/codegen/xai-grok-memory" }

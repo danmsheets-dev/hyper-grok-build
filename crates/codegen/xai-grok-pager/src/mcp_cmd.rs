@@ -103,6 +103,8 @@ pub enum McpCommand {
         /// Server name (e.g. chrome-devtools)
         name: String,
     },
+    /// Serve Turbo's file tools to an external MCP client over loopback
+    Serve(crate::mcp_serve_cmd::McpServeArgs),
 }
 
 // Everything `mcp add` accepts, before validation; `resolve_add` turns it
@@ -161,6 +163,7 @@ pub async fn run(mcp_args: McpArgs) -> Result<()> {
         McpCommand::Disable { name } => run_set_enabled(&name, false).await,
         McpCommand::Doctor { json, name } => run_doctor(json, name).await,
         McpCommand::Restart { name } => run_restart(&name).await,
+        McpCommand::Serve(args) => crate::mcp_serve_cmd::run(args).await,
     }
 }
 

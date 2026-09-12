@@ -253,24 +253,45 @@ pub(crate) async fn run_search_replace(
         ));
     }
     // Session policy engine v1: refuse edits to denied paths before any I/O.
-    let policy = {
+    let (policy, served_edit_policy) = {
         let res = resources.lock().await;
         let params = res.get::<Params<crate::implementations::grok_build::policy::PolicyParams>>();
-        crate::implementations::grok_build::policy::PolicyParams::resolve_from(
-            params.map(|p| &p.0),
-            Some(&cwd),
+        (
+            crate::implementations::grok_build::policy::PolicyParams::resolve_from(
+                params.map(|p| &p.0),
+                Some(&cwd),
+            ),
+            res.get::<crate::types::resources::ServedEditPolicy>()
+                .copied(),
         )
     };
     if let Some(frag) = policy.path_denied(&path) {
+        let target = format!("`{}`", input.file_path);
+        // A served client gets the refusal as an error its server reports
+        // without quoting the policy.
+        if served_edit_policy.is_some() {
+            return Err(crate::implementations::grok_build::policy::denied_error(
+                "search_replace",
+                "deny_paths",
+                &target,
+            ));
+        }
         return Ok(SearchReplaceOutput::InvalidInput(
             crate::implementations::grok_build::policy::denial(
                 "search_replace",
                 "deny_paths",
-                &format!("`{}`", input.file_path),
+                &target,
             ) + &format!(" — matched deny-path fragment `{frag}`"),
         ));
     }
     if crate::implementations::grok_build::policy::grok_home_credential_denied(&path) {
+        if served_edit_policy.is_some() {
+            return Err(crate::implementations::grok_build::policy::denied_error(
+                "search_replace",
+                "grok_home_credentials",
+                &format!("`{}`", input.file_path),
+            ));
+        }
         return Ok(SearchReplaceOutput::InvalidInput(
             crate::implementations::grok_build::policy::grok_home_credential_denial(
                 "search_replace",
@@ -279,13 +300,21 @@ pub(crate) async fn run_search_replace(
         ));
     }
     // Execution receipts (Phase 5): snapshot pre-edit contents so a rollback
-    // receipt can restore them. Storage failures degrade to no-receipt.
-    let session_folder = {
+    // receipt can restore them. Storage failures degrade to no-receipt. A
+    // served edit keeps a copy only if its policy asks for one.
+    let record_receipt = served_edit_policy.is_none_or(|bounds| bounds.record_receipts);
+    let session_folder = if record_receipt {
         let res = resources.lock().await;
         res.get::<crate::types::resources::SessionFolder>()
             .map(|s| s.0.clone())
+    } else {
+        None
     };
-    let pre_edit_bytes: Option<Vec<u8>> = fs.read_file(&path).await.ok();
+    let pre_edit_bytes: Option<Vec<u8>> = if record_receipt {
+        fs.read_file(&path).await.ok()
+    } else {
+        None
+    };
     let (empty_old_string_does_not_override, include_user_edit_hint);
     {
         let res = resources.lock().await;
@@ -330,26 +359,34 @@ pub(crate) async fn run_search_replace(
         .await?
     };
     if let SearchReplaceOutput::EditsApplied(applied) = &result {
-        let (mut added, mut removed) = (0i64, 0i64);
-        for detail in &applied.edits.details {
-            let (a, r) = crate::types::output::line_diff(&detail.old_string, &detail.new_string);
-            added += a;
-            removed += r;
+        // Line counts for Turbo's own sessions. A served edit skips them: its
+        // strings are the client's, and diffing them costs what they make it.
+        if served_edit_policy.is_none() {
+            let (mut added, mut removed) = (0i64, 0i64);
+            for detail in &applied.edits.details {
+                let (a, r) =
+                    crate::types::output::line_diff(&detail.old_string, &detail.new_string);
+                added += a;
+                removed += r;
+            }
+            tracing::info_span!(
+                "edit.lines",
+                tool_name = "search_replace",
+                lines_added = added,
+                lines_removed = removed
+            )
+            .in_scope(|| {});
         }
-        tracing::info_span!(
-            "edit.lines",
-            tool_name = "search_replace",
-            lines_added = added,
-            lines_removed = removed
-        )
-        .in_scope(|| {});
         // Execution receipts: hash the post-edit file and persist the receipt
         // with the pre-edit bytes as the undo payload (audit + rollback).
-        let hash_after = fs
-            .read_file(&path)
-            .await
-            .ok()
-            .map(|bytes| crate::implementations::grok_build::receipts::hash_bytes(&bytes));
+        let hash_after = if record_receipt {
+            fs.read_file(&path)
+                .await
+                .ok()
+                .map(|bytes| crate::implementations::grok_build::receipts::hash_bytes(&bytes))
+        } else {
+            None
+        };
         if let Some(session) = session_folder.as_deref() {
             let undo_payload = pre_edit_bytes.as_deref().filter(|_| hash_after.is_some());
             crate::implementations::grok_build::receipts::try_record(
@@ -393,16 +430,34 @@ fn validate_path_length(file_path: &str) -> Option<SearchReplaceOutput> {
     None
 }
 
+/// The `max_diff_lines` refusal, if the edit adds too many lines. `exact` says
+/// whether `added_lines` is the smallest diff's count or a higher bound. A
+/// served toolset gets the refusal as a `policy_denied` error, which its server
+/// reports without quoting the policy.
 fn max_diff_limit_error(
     policy: &crate::implementations::grok_build::policy::PolicyParams,
     added_lines: u64,
-) -> Option<SearchReplaceOutput> {
+    exact: bool,
+    served: bool,
+) -> Option<Result<SearchReplaceOutput, xai_tool_runtime::ToolError>> {
     policy.diff_exceeds_limit(added_lines).map(|(added, max)| {
-        SearchReplaceOutput::InvalidInput(crate::implementations::grok_build::policy::denial(
-            "search_replace",
-            "max_diff_lines",
-            &format!("edit adding {added} lines (limit {max})"),
-        ))
+        let detail =
+            crate::implementations::grok_build::policy::diff_limit_detail(added, max, exact);
+        if served {
+            Err(crate::implementations::grok_build::policy::denied_error(
+                "search_replace",
+                "max_diff_lines",
+                &detail,
+            ))
+        } else {
+            Ok(SearchReplaceOutput::InvalidInput(
+                crate::implementations::grok_build::policy::denial(
+                    "search_replace",
+                    "max_diff_lines",
+                    &detail,
+                ),
+            ))
+        }
     })
 }
 /// Handle new file creation when `old_string` is empty.
@@ -436,11 +491,16 @@ async fn handle_new_file_creation(
             old_string_name
         )));
     }
-    let added_lines = crate::types::output::line_diff("", &input.new_string)
-        .0
-        .max(0) as u64;
-    if let Some(error) = max_diff_limit_error(policy, added_lines) {
-        return Ok(error);
+    let served = resources
+        .lock()
+        .await
+        .get::<crate::types::resources::ServedEditPolicy>()
+        .is_some();
+    // Every line of a new file is added; counting them needs no diff, only the
+    // diff's own idea of a line.
+    let added_lines = crate::types::output::diff_line_count(&input.new_string) as u64;
+    if let Some(refusal) = max_diff_limit_error(policy, added_lines, true, served) {
+        return refusal;
     }
     if let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
         return Ok(match e.io_error_kind() {
@@ -799,6 +859,34 @@ async fn handle_replacement(
             replace_all_name
         )));
     }
+    // A served toolset bounds what an edit may build: every replacement copies
+    // `new_string`, so a small request could otherwise demand gigabytes.
+    let served_edit_policy = {
+        let res = resources.lock().await;
+        res.get::<crate::types::resources::ServedEditPolicy>()
+            .copied()
+    };
+    if let Some(bounds) = served_edit_policy {
+        // Exact for plain matches. A normalized match can be longer than
+        // `old_string`, so for those nothing is subtracted.
+        let removed = if used_normalized_fallback {
+            0
+        } else {
+            positions.len().saturating_mul(input.old_string.len())
+        };
+        let projected = match_text
+            .len()
+            .saturating_sub(removed)
+            .saturating_add(positions.len().saturating_mul(input.new_string.len()));
+        if projected > bounds.max_result_bytes {
+            return Ok(SearchReplaceOutput::InvalidInput(format!(
+                "Error: this edit would make {} larger than the {} MiB this server edits. \
+                 Replace fewer occurrences at a time.",
+                input.file_path,
+                bounds.max_result_bytes / (1024 * 1024)
+            )));
+        }
+    }
     let (new_text, new_positions) = if used_normalized_fallback {
         let normalized_matches =
             match find_normalized_match_positions(&match_text, &input.old_string) {
@@ -829,11 +917,26 @@ async fn handle_replacement(
     } else {
         new_text.clone()
     };
-    let added_lines = crate::types::output::line_diff(&old_text, &write_text)
-        .0
-        .max(0) as u64;
-    if let Some(error) = max_diff_limit_error(policy, added_lines) {
-        return Ok(error);
+    // The diff only feeds `max_diff_lines`, so it runs only under that limit. A
+    // served edit bounds it: diffing a large rewrite line by line can take very
+    // long and much memory.
+    let (added_lines, exact) = if policy.max_diff_lines.is_none() {
+        (0, true)
+    } else if served_edit_policy.is_some() {
+        let count = crate::types::output::line_diff_bounded(&old_text, &write_text);
+        (count.added.max(0) as u64, count.exact)
+    } else {
+        (
+            crate::types::output::line_diff(&old_text, &write_text)
+                .0
+                .max(0) as u64,
+            true,
+        )
+    };
+    if let Some(refusal) =
+        max_diff_limit_error(policy, added_lines, exact, served_edit_policy.is_some())
+    {
+        return refusal;
     }
     if let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
         return Ok(match e.io_error_kind() {
@@ -859,11 +962,16 @@ async fn handle_replacement(
         previous_content: Some(old_text.clone()),
         is_new_file: false,
     });
+    // Each detail scans and copies from the whole file, so a served edit builds
+    // only as many as its policy allows.
+    let detailed = served_edit_policy.map_or(new_positions.len(), |bounds| {
+        new_positions.len().min(bounds.max_detailed_edits)
+    });
     let edits = build_edit_details(
         &new_text,
         &input.old_string,
         &input.new_string,
-        &new_positions,
+        &new_positions[..detailed],
         CONTEXT_LINES,
     );
     let (tool_output_for_prompt, tool_output_for_prompt_concise) = if new_positions.len() == 1 {

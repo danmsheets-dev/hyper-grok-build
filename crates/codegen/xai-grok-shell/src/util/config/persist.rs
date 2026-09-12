@@ -4,34 +4,30 @@ use anyhow::Result;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
 use xai_grok_agent::prompt::skills::SkillsConfig;
-/// Process-wide write lock for `~/.grok/config.toml`.
-///
-/// Serializes the read-modify-write in `save_config` so two rapid
-/// settings toggles can't interleave and clobber each other.
+/// Serializes local writers before acquiring the cross-process config lock.
 static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-/// [`save_config`] body; caller must hold [`SAVE_LOCK`].
-async fn save_config_locked(config: &Config) -> Result<()> {
+
+pub(crate) struct ConfigWriteGuard {
+    _file_lock: std::fs::File,
+    _process_guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Move the transaction guard into the writer so cancellation cannot unlock early.
+async fn save_config_locked(config: &Config, guard: ConfigWriteGuard) -> Result<()> {
     let path = user_config_path();
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => match toml::from_str::<TomlValue>(&s) {
-            Ok(v) => v,
-            Err(parse_err) => {
-                return Err(anyhow::anyhow!(
-                    "refusing to overwrite unparseable {}: {}; save a backup \
-                         and fix the syntax error before retrying",
-                    path.display(),
-                    parse_err,
-                ));
-            }
-        },
-        Err(_) => TomlValue::Table(TomlMap::new()),
-    };
+    let mut root = read_config_for_write(&path).await?;
     if !matches!(root, TomlValue::Table(_)) {
         root = TomlValue::Table(TomlMap::new());
     }
     let table = root.as_table_mut().expect("root must be a table");
     merge_section(table, "cli", &config.cli);
     merge_section(table, "models", &config.models);
+    if config.models.default.is_none()
+        && let Some(models) = table.get_mut("models").and_then(TomlValue::as_table_mut)
+    {
+        // Unlike unmodeled keys, this optional field supports explicit clearing.
+        models.remove("default");
+    }
     merge_section(table, "ui", &config.ui);
     merge_section(table, "harness", &config.harness);
     merge_section(table, "session", &config.session);
@@ -47,46 +43,79 @@ async fn save_config_locked(config: &Config) -> Result<()> {
         merge_section(table, "skills", &config.skills);
     }
     let toml_str = toml::to_string_pretty(&root)?;
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let write_path = xai_grok_config::fs_atomic::resolve_write_target(&path)?;
-    if let Some(parent) = write_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    #[cfg(unix)]
-    let prior_mode: Option<u32> = match tokio::fs::metadata(&write_path).await {
-        Ok(m) => {
-            use std::os::unix::fs::PermissionsExt;
-            Some(m.permissions().mode())
-        }
-        Err(_) => None,
-    };
-    #[cfg(not(unix))]
-    let prior_mode: Option<u32> = None;
-    let suffix = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("toml.tmp.{}.{}", std::process::id(), nanos)
-    };
-    let tmp = write_path.with_extension(suffix);
-    tokio::fs::write(&tmp, toml_str).await?;
-    #[cfg(unix)]
-    if let Some(mode) = prior_mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await;
-    }
-    let _ = prior_mode;
-    tokio::fs::rename(&tmp, &write_path).await?;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        atomic_write_string(&path, &toml_str)
+    })
+    .await??;
     Ok(())
 }
-/// Acquire the `config.toml` write lock used by [`save_config`], so callers that
-/// mutate the file directly (marketplace add/remove) can't interleave with a
-/// settings save and clobber it.
-pub(crate) async fn lock_config_writes() -> tokio::sync::MutexGuard<'static, ()> {
-    SAVE_LOCK.lock().await
+/// Hold both locks across the complete user-config read-modify-write.
+pub(crate) async fn lock_config_writes() -> Result<ConfigWriteGuard> {
+    lock_config_writes_at(&user_config_path()).await
+}
+
+pub(crate) async fn lock_config_writes_at(path: &std::path::Path) -> Result<ConfigWriteGuard> {
+    let process_guard = SAVE_LOCK.lock().await;
+    let path = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || lock_config_file(&path)).await??;
+    Ok(ConfigWriteGuard {
+        _file_lock: file,
+        _process_guard: process_guard,
+    })
+}
+
+/// Shared with synchronous startup writers; never unlink a live lock file.
+pub(crate) fn lock_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use fs2::FileExt as _;
+    let path = xai_grok_config::fs_atomic::resolve_write_target(path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("toml.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if xai_grok_workspace::util::is_lock_contended(&error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "timed out acquiring config write lock: {}",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Read the literal document for mutation, without expanding environment references.
+pub(crate) async fn read_config_for_write(path: &std::path::Path) -> Result<TomlValue> {
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TomlValue::Table(TomlMap::new()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    toml::from_str(&contents).map_err(|error| {
+        anyhow::anyhow!(
+            "refusing to overwrite unparseable {}: {}",
+            path.display(),
+            xai_grok_config::toml_error_detail(&contents, &error),
+        )
+    })
 }
 /// Read a file, treating only `NotFound` as empty. Hard read errors (EACCES,
 /// EIO) propagate so callers don't clobber an unreadable file on the next write.
@@ -206,13 +235,16 @@ pub async fn update_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
-    let _guard = SAVE_LOCK.lock().await;
-    let root: TomlValue =
-        crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
+    let guard = lock_config_writes().await?;
+    let root = read_config_for_write(&user_config_path()).await?;
     let mut cfg = load_config_from_toml(&root);
     f(&mut cfg);
-    save_config_locked(&cfg).await
+    save_config_locked(&cfg, guard).await
 }
+#[cfg(test)]
+#[path = "persist_rc4_tests.rs"]
+mod rc4_tests;
+
 #[cfg(test)]
 mod tests {
     use super::super::load::load_config_from_toml;

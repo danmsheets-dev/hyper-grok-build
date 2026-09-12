@@ -82,6 +82,11 @@ pub static USER_GUIDE: &[Doc] = &[
         "Setting up external tool integrations via MCP"
     ),
     guide!(
+        "32-mcp-server.md",
+        "MCP Server (turbo mcp serve)",
+        "Serve bounded file tools to an external MCP client over loopback"
+    ),
+    guide!(
         "08-skills.md",
         "Skills",
         "Creating and using reusable prompt packages"

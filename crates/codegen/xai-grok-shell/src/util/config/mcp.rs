@@ -627,10 +627,8 @@ pub(crate) async fn save_mcp_disabled_tools(
     disabled_tools: &[String],
 ) -> Result<()> {
     let path = config_path();
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => toml::from_str(&s).unwrap_or(TomlValue::Table(TomlMap::new())),
-        Err(_) => TomlValue::Table(TomlMap::new()),
-    };
+    let _guard = super::persist::lock_config_writes_at(&path).await?;
+    let mut root = super::persist::read_config_for_write(&path).await?;
     let table = root
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
@@ -760,7 +758,7 @@ async fn write_toml_table_if_changed(
 ) -> Result<bool> {
     let is_user = path == config_path().as_path();
     let _guard = if is_user {
-        Some(super::persist::lock_config_writes().await)
+        Some(super::persist::lock_config_writes().await?)
     } else {
         None
     };
@@ -782,7 +780,7 @@ async fn write_toml_table_if_changed(
                 return Err(anyhow::anyhow!(
                     "refusing to overwrite unparseable {}: {}; fix the syntax before retrying",
                     path.display(),
-                    parse_err
+                    xai_grok_config::toml_error_detail(&original, &parse_err)
                 ));
             }
         }
@@ -961,10 +959,8 @@ pub async fn save_mcp_server_config_at(
     server_name: &str,
     config: &McpServerConfig,
 ) -> Result<()> {
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => toml::from_str(&s).unwrap_or(TomlValue::Table(TomlMap::new())),
-        Err(_) => TomlValue::Table(TomlMap::new()),
-    };
+    let _guard = super::persist::lock_config_writes_at(&path).await?;
+    let mut root = super::persist::read_config_for_write(&path).await?;
     let table = root
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
@@ -1013,10 +1009,11 @@ pub async fn delete_mcp_server_config_at(
     path: &std::path::Path,
     server_name: &str,
 ) -> Result<bool> {
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => toml::from_str(&s).unwrap_or(TomlValue::Table(TomlMap::new())),
-        Err(_) => return Ok(false),
-    };
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let guard = super::persist::lock_config_writes_at(path).await?;
+    let mut root = super::persist::read_config_for_write(path).await?;
     let table = root
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
@@ -1065,6 +1062,7 @@ pub async fn delete_mcp_server_config_at(
     let toml_str = toml::to_string_pretty(&root)?;
     super::persist::atomic_write_string(path, &toml_str)?;
 
+    drop(guard);
     // Clean up OAuth credentials for the deleted server.
     if let Ok(mut cred_store) = xai_grok_mcp::credentials::McpCredentialStore::load_default() {
         let removed = cred_store.remove_by_server_name(server_name);

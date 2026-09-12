@@ -28,6 +28,7 @@ Customize and extend Grok Build.
 |---|----------|-------------|
 | 6 | [Theming and Appearance](06-theming.md) | Themes, the `/theme` command, `pager.toml`, and color-support detection |
 | 7 | [MCP Servers](07-mcp-servers.md) | External tool integrations through the Model Context Protocol |
+| 32 | [MCP Server (`turbo mcp serve`)](32-mcp-server.md) | Serve bounded file tools to an external MCP client over loopback, with an optional tunnel and OAuth 2.1 for ChatGPT Developer mode |
 | 8 | [Skills](08-skills.md) | Reusable prompt packages in the SKILL.md format |
 | 9 | [Plugins](09-plugins.md) | Bundle and share skills, commands, agents, hooks, and MCP servers; install from, author, and govern marketplaces (organization controls) |
 | 10 | [Hooks](10-hooks.md) | Lifecycle scripts and HTTP callbacks for pre- and post-tool-use events |

@@ -479,6 +479,10 @@ pub(super) fn handle_auth_complete(
     } = &app.auth_state
         && *current_seq == request_seq
     {
+        app.codex_quota = crate::app::codex_quota::CodexQuotaState::default();
+        for agent in app.agents.values_mut() {
+            agent.codex_quota = None;
+        }
         if let Some(meta_val) = meta.as_ref()
             && let Ok(auth_meta) =
                 serde_json::from_value::<xai_grok_shell::auth::AuthMeta>(meta_val.clone())
@@ -536,6 +540,7 @@ pub(super) fn handle_auth_complete(
                 effects.push(Effect::FetchAppBilling);
             }
             effects.extend(retry_effects);
+            effects.extend(crate::app::codex_quota::request_for_current(app, true, 0));
             return effects;
         }
 
@@ -572,6 +577,7 @@ pub(super) fn handle_auth_complete(
         if app.session_startup_allowed() {
             effects.extend(drain_startup_actions(app));
         }
+        effects.extend(crate::app::codex_quota::request_for_current(app, true, 0));
         return effects;
     }
     vec![]

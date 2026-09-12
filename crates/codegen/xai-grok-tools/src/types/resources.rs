@@ -466,6 +466,35 @@ pub struct DisplayCwd(pub PathBuf);
 /// Empty when no managed Read denies apply.
 #[derive(Debug, Clone, Default)]
 pub struct DenyReadGlobs(pub Vec<String>);
+
+/// Grep hardening for a toolset served to an untrusted client
+/// (`turbo mcp serve`). When present, ripgrep ignores the operator's ripgrep
+/// config and never follows symlinks, is killed if the search is abandoned,
+/// and every result from a file `allow_file` rejects is dropped before it is
+/// counted, truncated or rendered.
+#[derive(Clone)]
+pub struct ServedGrepPolicy {
+    pub allow_file: std::sync::Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for ServedGrepPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServedGrepPolicy").finish_non_exhaustive()
+    }
+}
+
+/// Edit bounds for a toolset served to an untrusted client (`turbo mcp serve`).
+/// When present, `search_replace` refuses an edit that would produce a file of
+/// more than `max_result_bytes`, builds details for at most
+/// `max_detailed_edits` of its replacements, skips its line-count telemetry,
+/// keeps a receipt with the file's previous content only if `record_receipts`
+/// is set, and reports a workspace policy refusal as a `policy_denied` error.
+#[derive(Debug, Clone, Copy)]
+pub struct ServedEditPolicy {
+    pub max_result_bytes: usize,
+    pub max_detailed_edits: usize,
+    pub record_receipts: bool,
+}
 /// Optional confinement root stamped into tool resources when `--confine` /
 /// `--workspace-root` is set. Absolute model paths that do not resolve under
 /// this root must be rejected (see [`path_is_under_confine_root`]) — never
@@ -559,23 +588,24 @@ pub fn enforce_allowed_write_paths(
     // Canonicalize before the relative-prefix check so a symlink under an
     // allowed prefix (Schedules -> ~/.ssh) cannot lexical-match then write
     // through the link (F66). Fail closed when no ancestor can be resolved.
-    let cwd_c = canonicalize_for_permission(cwd);
-    let res_c = canonicalize_for_permission(resolved);
-    if res_c.lexical_only {
+    // Containment follows `path_is_under_confine_root`: the case-folded
+    // `compare` forms would also take in a case-distinct sibling of `cwd` in a
+    // case-sensitive directory.
+    let cwd_r = canonicalize_with_ancestor_walk(cwd);
+    let res_r = canonicalize_with_ancestor_walk(resolved);
+    if res_r.lexical_only || !resolved_is_under(&res_r, &cwd_r) {
         return Err(AllowedPathsViolation {
             path: resolved.display().to_string(),
             allowed: allowed.to_vec(),
         });
     }
-    let rel: PathBuf = match res_c.compare.strip_prefix(&cwd_c.compare) {
-        Ok(r) => r.to_path_buf(),
-        Err(_) => {
-            return Err(AllowedPathsViolation {
-                path: resolved.display().to_string(),
-                allowed: allowed.to_vec(),
-            });
-        }
-    };
+    // By component count rather than `strip_prefix`: a resolved path longer than
+    // MAX_PATH keeps its `\\?\` spelling while `cwd` does not. Both sides are
+    // folded alike, so they split into components alike.
+    let rel: PathBuf = fold_for_compare(&res_r.display)
+        .components()
+        .skip(fold_for_compare(&cwd_r.display).components().count())
+        .collect();
     let rel_str = rel.to_string_lossy().replace('\\', "/");
     // Collapse `..` / reject absolute-style relative escapes so write-time
     // gates match land_subagent normalize_allowlist_path semantics.
@@ -831,8 +861,17 @@ pub fn collect_write_roots(
     roots
 }
 
+/// Whether `a` and `b` name the same directory, by the rules of
+/// [`path_is_under_confine_root`]. Equal case-folded `compare` forms would
+/// merge case-distinct directories in a case-sensitive parent. Two spellings
+/// with no resolvable ancestor are the same only when they are identical.
 fn paths_equal_for_confine(a: &std::path::Path, b: &std::path::Path) -> bool {
-    canonicalize_for_permission(a).compare == canonicalize_for_permission(b).compare
+    let a = canonicalize_with_ancestor_walk(a);
+    let b = canonicalize_with_ancestor_walk(b);
+    if a.lexical_only || b.lexical_only {
+        return a.display == b.display;
+    }
+    resolved_is_under(&a, &b) && resolved_is_under(&b, &a)
 }
 
 /// Resolve a write-tool path: when a session [`ConfineRoot`] **or** process
@@ -899,16 +938,19 @@ pub struct CanonicalPermissionPath {
 ///   components (lexically cleaned). `…/MAINRE~1/new.txt` therefore resolves
 ///   its parent to `…/Main Repo` and is correctly denied by a
 ///   `Main Repo/**` rule.
+/// - A `..` in that tail can step back into directories that exist, so the
+///   tail is collapsed and the result resolved again: a symlink named after
+///   the `..` is followed like any other.
 /// - If no ancestor can be canonicalized, fall back to a lexical clean only
 ///   and set [`CanonicalPermissionPath::lexical_only`]. Callers under confine
 ///   treat that as outside the root — never as allow.
 pub fn canonicalize_for_permission(path: &std::path::Path) -> CanonicalPermissionPath {
-    let (display, lexical_only) = canonicalize_with_ancestor_walk(path);
-    let compare = fold_for_compare(&display);
+    let resolved = canonicalize_with_ancestor_walk(path);
+    let compare = fold_for_compare(&resolved.display);
     CanonicalPermissionPath {
         compare,
-        display,
-        lexical_only,
+        display: resolved.display,
+        lexical_only: resolved.lexical_only,
     }
 }
 
@@ -924,25 +966,139 @@ pub fn canonical_path_for_permission(path: &std::path::Path) -> PathBuf {
 /// **Fail closed:** if `path` cannot be resolved via any existing ancestor
 /// (`lexical_only`), returns `false` and logs why. An unresolvable path must
 /// never mean "allow" under confine — that was the previous escape hatch.
+///
+/// **Letter case:** components that exist are compared exactly, in the
+/// spelling `fs::canonicalize` returns for them, so a root typed in another
+/// case still matches its directory. Folding case there is an escape: an NTFS
+/// directory can be case-sensitive (`fsutil file setCaseSensitiveInfo`, or
+/// created from WSL), and inside one `C:\work\app` and `C:\work\APP` are
+/// different directories. Where neither side exists yet there is no on-disk
+/// spelling, and ASCII case is ignored only when the deepest directory both
+/// sides share is known not to be case-sensitive (a flag that cannot be read
+/// counts as case-sensitive), so a case variant of a root removed from a
+/// case-sensitive directory is still refused. Drive letters and server or share
+/// names never distinguish case, and the `\\?\` spelling of a drive or share
+/// matches the plain one.
 pub fn path_is_under_confine_root(path: &std::path::Path, root: &std::path::Path) -> bool {
-    let path_c = canonicalize_for_permission(path);
-    let root_c = canonicalize_for_permission(root);
-    if path_c.lexical_only {
+    let path_r = canonicalize_with_ancestor_walk(path);
+    if path_r.lexical_only {
         // Fail closed: no fs-backed resolution → treat as outside the root.
         // Lexical-only collapse of `..` is not enough (8.3 / symlink escapes).
         tracing::warn!(
             path = %path.display(),
-            resolved = %path_c.display.display(),
+            resolved = %path_r.display.display(),
             root = %root.display(),
             "confine: path has no canonicalizable ancestor; denying (fail closed)"
         );
         return false;
     }
-    if path_c.compare == root_c.compare {
-        return true;
+    resolved_is_under(&path_r, &canonicalize_with_ancestor_walk(root))
+}
+
+/// The comparison behind [`path_is_under_confine_root`], on paths already
+/// reduced by [`canonicalize_with_ancestor_walk`]. It ignores `lexical_only`;
+/// callers decide what an unresolvable path means.
+fn resolved_is_under(path: &ResolvedPath, root: &ResolvedPath) -> bool {
+    // Before this index every component exists on at least one side and must
+    // match exactly, so by the time a later component is compared, the first
+    // `shared_on_disk` components name a directory both sides share on disk.
+    let shared_on_disk = path.on_disk.max(root.on_disk);
+    let mut shared_dir_ignores_case = None;
+    // Component-wise so `C:\work` does not match `C:\work-evil\file`.
+    let mut path_components = path.display.components();
+    root.display.components().enumerate().all(|(index, want)| {
+        let Some(got) = path_components.next() else {
+            return false;
+        };
+        confine_components_match(got, want, false)
+            || (index >= shared_on_disk
+                && confine_components_match(got, want, true)
+                && *shared_dir_ignores_case.get_or_insert_with(|| {
+                    let shared: PathBuf = path.display.components().take(shared_on_disk).collect();
+                    dir_case_sensitivity(&shared) == Some(false)
+                }))
+    })
+}
+
+/// One component of a resolved path against the same position in a resolved
+/// root. `ignore_ascii_case` relaxes directory entry names only.
+fn confine_components_match(
+    got: std::path::Component<'_>,
+    want: std::path::Component<'_>,
+    ignore_ascii_case: bool,
+) -> bool {
+    use std::path::{Component, Prefix};
+    match (got, want) {
+        (Component::Prefix(got), Component::Prefix(want)) => {
+            let fold = |s: &std::ffi::OsStr| s.to_string_lossy().to_lowercase();
+            // Drive letters and server or share names never distinguish case,
+            // and `\\?\C:` is the same volume as `C:`: an existing path longer
+            // than MAX_PATH canonicalizes to the verbatim spelling.
+            match (got.kind(), want.kind()) {
+                (
+                    Prefix::Disk(got) | Prefix::VerbatimDisk(got),
+                    Prefix::Disk(want) | Prefix::VerbatimDisk(want),
+                ) => got.eq_ignore_ascii_case(&want),
+                (
+                    Prefix::UNC(got_server, got_share) | Prefix::VerbatimUNC(got_server, got_share),
+                    Prefix::UNC(want_server, want_share)
+                    | Prefix::VerbatimUNC(want_server, want_share),
+                ) => fold(got_server) == fold(want_server) && fold(got_share) == fold(want_share),
+                _ => fold(got.as_os_str()) == fold(want.as_os_str()),
+            }
+        }
+        // ASCII only: Unicode lowercasing does not agree with the volume's
+        // upcase table for every character, and a false match admits a path.
+        (Component::Normal(got), Component::Normal(want)) => {
+            got == want
+                || (ignore_ascii_case
+                    && got
+                        .as_encoded_bytes()
+                        .eq_ignore_ascii_case(want.as_encoded_bytes()))
+        }
+        (got, want) => got == want,
     }
-    // Component-wise prefix so `C:\work` does not match `C:\work-evil\file`.
-    path_c.compare.starts_with(&root_c.compare)
+}
+
+/// Whether names in the existing directory `dir` are case-sensitive: the NTFS
+/// flag `fsutil file setCaseSensitiveInfo` sets, and WSL sets on directories it
+/// creates. `None` when the flag cannot be read.
+#[cfg(windows)]
+fn dir_case_sensitivity(dir: &std::path::Path) -> Option<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FileCaseSensitiveInfo, GetFileInformationByHandleEx,
+    };
+    // From winnt.h. The `windows` crate declares it under a feature this crate
+    // does not enable.
+    const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x1;
+
+    let handle = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(dir)
+        .ok()?;
+    let mut info = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
+    // SAFETY: `info` is a live, writable FILE_CASE_SENSITIVE_INFO and the size
+    // passed is its size; `handle` stays open for the whole call.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(handle.as_raw_handle()),
+            FileCaseSensitiveInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    }
+    .ok()?;
+    Some(info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+}
+
+#[cfg(not(windows))]
+fn dir_case_sensitivity(_dir: &std::path::Path) -> Option<bool> {
+    None
 }
 
 /// True when `path` is under **any** of `roots` after
@@ -954,13 +1110,30 @@ pub fn path_is_under_any_root(path: &std::path::Path, roots: &[PathBuf]) -> bool
         .any(|root| path_is_under_confine_root(path, root))
 }
 
+/// A path reduced by [`canonicalize_with_ancestor_walk`].
+struct ResolvedPath {
+    /// Canonical existing prefix, then the lexically cleaned tail that does
+    /// not exist yet.
+    display: PathBuf,
+    /// How many leading components of `display` came from `fs::canonicalize`.
+    /// Only those carry their on-disk spelling; the rest are as the caller
+    /// wrote them.
+    on_disk: usize,
+    /// No ancestor could be canonicalized.
+    lexical_only: bool,
+}
+
 /// Canonicalise via `fs::canonicalize` when the path exists; otherwise walk
 /// up to the nearest existing ancestor, canonicalize that, and re-join the
-/// non-existent tail. Returns `(display_path, lexical_only)`.
-fn canonicalize_with_ancestor_walk(path: &std::path::Path) -> (PathBuf, bool) {
+/// non-existent tail.
+fn canonicalize_with_ancestor_walk(path: &std::path::Path) -> ResolvedPath {
     // Fast path: path exists (or is a symlink the OS can resolve).
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return (dunce::simplified(&canon).to_path_buf(), false);
+    if let Ok(display) = dunce::canonicalize(path) {
+        return ResolvedPath {
+            on_disk: display.components().count(),
+            display,
+            lexical_only: false,
+        };
     }
 
     // Write targets usually do not exist yet. Walk up until canonicalize
@@ -969,6 +1142,7 @@ fn canonicalize_with_ancestor_walk(path: &std::path::Path) -> (PathBuf, bool) {
     // segment intact and deny/confine globs keyed on the long name miss it.
     let mut cursor = path.to_path_buf();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut tail_has_parent_dir = false;
     loop {
         let parent = match cursor.parent() {
             Some(p) if p != cursor.as_path() => p.to_path_buf(),
@@ -982,18 +1156,34 @@ fn canonicalize_with_ancestor_walk(path: &std::path::Path) -> (PathBuf, bool) {
         // the filesystem sees it.
         match cursor.components().next_back() {
             Some(std::path::Component::Normal(name)) => tail.push(name.to_os_string()),
-            Some(std::path::Component::ParentDir) => tail.push(std::ffi::OsString::from("..")),
+            Some(std::path::Component::ParentDir) => {
+                tail.push(std::ffi::OsString::from(".."));
+                tail_has_parent_dir = true;
+            }
             _ => {}
         }
         cursor = parent;
-        if let Ok(canon) = std::fs::canonicalize(&cursor) {
-            let mut out = dunce::simplified(&canon).to_path_buf();
+        if let Ok(mut out) = dunce::canonicalize(&cursor) {
+            let on_disk = out.components().count();
             // Re-join farthest-parent → leaf (tail was pushed leaf-first).
             for component in tail.into_iter().rev() {
                 out.push(component);
             }
             // Collapse `.` / `..` that lived only in the non-existent tail.
-            return (lexical_clean(&out), false);
+            let cleaned = lexical_clean(&out);
+            if tail_has_parent_dir {
+                // The `..` may have stepped back into directories that exist,
+                // and nothing after it was resolved: `root/missing/../link/x`
+                // would keep `link` as spelled while a write follows the
+                // symlink. The cleaned path has no `..` left, so this recurses
+                // once at most.
+                return canonicalize_with_ancestor_walk(&cleaned);
+            }
+            return ResolvedPath {
+                display: cleaned,
+                on_disk,
+                lexical_only: false,
+            };
         }
     }
 
@@ -1009,7 +1199,11 @@ fn canonicalize_with_ancestor_walk(path: &std::path::Path) -> (PathBuf, bool) {
         path = %path.display(),
         "canonicalize_for_permission: no ancestor could be canonicalized; lexical-only fallback"
     );
-    (lexical_clean(path), true)
+    ResolvedPath {
+        display: lexical_clean(path),
+        on_disk: 0,
+        lexical_only: true,
+    }
 }
 
 /// Collapse `.` and `..` without touching the filesystem. Does **not** expand
@@ -3015,6 +3209,323 @@ mod tests {
                 .starts_with(&super::canonicalize_for_permission(&root).compare),
             "dotdot path should land under root: {:?}",
             c.display
+        );
+    }
+
+    /// NTFS directories can be case-sensitive (`fsutil file setCaseSensitiveInfo`;
+    /// WSL creates them that way). Inside one, `app` and `APP` are different
+    /// directories, so a confine root must not admit its case-distinct sibling.
+    #[cfg(windows)]
+    #[test]
+    fn confine_rejects_case_distinct_sibling_in_case_sensitive_dir() {
+        let Some(base) = case_sensitive_tempdir_or_skip() else {
+            return;
+        };
+        let root = base.path().join("app");
+        let sibling = base.path().join("APP");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sibling).unwrap_or_else(|e| {
+            panic!(
+                "fsutil reported success but `APP` collides with `app`, so `{}` is not \
+                 case-sensitive: {e}",
+                base.path().display()
+            )
+        });
+        std::fs::write(root.join("in.txt"), "in").unwrap();
+        std::fs::write(sibling.join("out.txt"), "out").unwrap();
+
+        assert!(super::path_is_under_confine_root(
+            &root.join("in.txt"),
+            &root
+        ));
+        assert!(super::path_is_under_confine_root(
+            &root.join("new").join("file.txt"),
+            &root
+        ));
+        assert!(
+            !super::path_is_under_confine_root(&sibling.join("out.txt"), &root),
+            "a file in the case-distinct sibling must be outside the root"
+        );
+        assert!(
+            !super::path_is_under_confine_root(&sibling, &root),
+            "the case-distinct sibling itself must be outside the root"
+        );
+        assert!(
+            !super::path_is_under_confine_root(&sibling.join("new").join("file.txt"), &root),
+            "a write target under the case-distinct sibling must be outside the root"
+        );
+        assert!(
+            !super::path_is_under_confine_root(&root.join("in.txt"), &sibling),
+            "the sibling root must not admit the original either"
+        );
+        // A case variant that does not exist yet would be created as a third
+        // directory, not open the root.
+        assert!(
+            !super::path_is_under_confine_root(&base.path().join("App").join("new.txt"), &root),
+            "a write that creates a new case variant of the root must be outside it"
+        );
+        assert!(!super::path_is_under_any_root(
+            &sibling.join("out.txt"),
+            std::slice::from_ref(&root)
+        ));
+    }
+
+    /// A root removed from a case-sensitive directory has no on-disk spelling
+    /// left, and a write to a case variant of it would create a different
+    /// directory, so the case variant must not be admitted.
+    #[cfg(windows)]
+    #[test]
+    fn confine_rejects_case_variant_of_removed_root_in_case_sensitive_dir() {
+        let Some(base) = case_sensitive_tempdir_or_skip() else {
+            return;
+        };
+        let root = base.path().join("gone");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+
+        assert!(
+            super::path_is_under_confine_root(&root.join("new.txt"), &root),
+            "the removed root's own spelling still matches"
+        );
+        assert!(
+            !super::path_is_under_confine_root(&base.path().join("GONE").join("new.txt"), &root),
+            "a case variant of a removed root must be outside it"
+        );
+    }
+
+    /// An existing path longer than `MAX_PATH` canonicalizes to a `\\?\C:\`
+    /// spelling while a short root keeps `C:\`. Both name the same volume, so
+    /// containment must not depend on which spelling came back.
+    #[cfg(windows)]
+    #[test]
+    fn confine_accepts_existing_long_path_under_short_root() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = root
+            .path()
+            .join("a".repeat(90))
+            .join("b".repeat(90))
+            .join("c".repeat(90));
+        std::fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("long.txt");
+        std::fs::write(&file, "deep").unwrap();
+        let resolved = super::canonicalize_for_permission(&file).display;
+        assert!(
+            matches!(
+                resolved.components().next(),
+                Some(std::path::Component::Prefix(prefix))
+                    if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+            ),
+            "the fixture must canonicalize to a verbatim drive spelling: {}",
+            resolved.display()
+        );
+
+        assert!(super::path_is_under_confine_root(&file, root.path()));
+        assert!(!super::path_is_under_confine_root(
+            &file,
+            &root.path().join("b".repeat(90))
+        ));
+    }
+
+    /// The allowlist is relative to the working directory, and a case-distinct
+    /// sibling of that directory in a case-sensitive parent is not under it.
+    #[cfg(windows)]
+    #[test]
+    fn allowed_write_paths_reject_case_distinct_sibling_of_cwd() {
+        let Some(base) = case_sensitive_tempdir_or_skip() else {
+            return;
+        };
+        let cwd = base.path().join("app");
+        let sibling = base.path().join("APP");
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(sibling.join("src")).unwrap();
+        let allowed = ["src".to_string()];
+
+        super::enforce_allowed_write_paths(&cwd, &cwd.join("src").join("a.rs"), &allowed)
+            .expect("a write under the working directory is allowed");
+        super::enforce_allowed_write_paths(&cwd, &sibling.join("src").join("a.rs"), &allowed)
+            .expect_err("a write under the case-distinct sibling must be refused");
+    }
+
+    /// Case-distinct directories in a case-sensitive parent are two roots, not
+    /// one root spelled twice.
+    #[cfg(windows)]
+    #[test]
+    fn collect_write_roots_keeps_case_distinct_extra_root() {
+        let Some(base) = case_sensitive_tempdir_or_skip() else {
+            return;
+        };
+        let cwd = base.path().join("app");
+        let extra = base.path().join("APP");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+
+        let roots = super::collect_write_roots(&cwd, None, std::slice::from_ref(&extra));
+        assert_eq!(roots, vec![cwd, extra]);
+    }
+
+    /// An extra root with no resolvable ancestor still merges with an identical
+    /// spelling of itself.
+    #[test]
+    fn collect_write_roots_merges_identical_unresolvable_extras() {
+        let cwd = tempfile::tempdir().unwrap();
+        let unresolvable = std::path::PathBuf::from("no-such-relative-extra-root");
+        let roots = super::collect_write_roots(
+            cwd.path(),
+            None,
+            &[unresolvable.clone(), unresolvable.clone()],
+        );
+        assert_eq!(roots, vec![cwd.path().to_path_buf(), unresolvable]);
+    }
+
+    /// A root typed in a different letter case from its on-disk name still
+    /// confines to that directory in an ordinary case-insensitive directory:
+    /// both sides resolve to the on-disk spelling before they are compared.
+    #[cfg(windows)]
+    #[test]
+    fn confine_accepts_root_and_path_spelled_in_other_letter_case() {
+        let base = tempfile::tempdir().unwrap();
+        assert_ne!(
+            super::dir_case_sensitivity(base.path()),
+            Some(true),
+            "this test needs an ordinary case-insensitive temp directory"
+        );
+        let on_disk = base.path().join("Project");
+        std::fs::create_dir_all(on_disk.join("src")).unwrap();
+        std::fs::write(on_disk.join("src").join("lib.rs"), "").unwrap();
+        let typed_root = base.path().join("PROJECT");
+
+        assert!(super::path_is_under_confine_root(
+            &base.path().join("project").join("SRC").join("LIB.rs"),
+            &typed_root
+        ));
+        assert!(super::path_is_under_confine_root(
+            &base.path().join(r"pRoJeCt\Src\new\mod.rs"),
+            &typed_root
+        ));
+        assert!(super::path_is_under_confine_root(&on_disk, &typed_root));
+        assert!(super::path_is_under_confine_root(&typed_root, &on_disk));
+        assert!(!super::path_is_under_confine_root(
+            &base.path().join("project-evil").join("x.rs"),
+            &typed_root
+        ));
+    }
+
+    /// Where neither the root nor the path exists yet there is no on-disk
+    /// spelling to compare, so in an ordinary case-insensitive directory letter
+    /// case is still ignored on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn confine_ignores_case_only_where_neither_side_exists() {
+        let base = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::dir_case_sensitivity(base.path()),
+            Some(false),
+            "this test needs a temp directory whose case sensitivity can be read and is off"
+        );
+        let root = base.path().join("Gone").join("Sub");
+        assert!(super::path_is_under_confine_root(
+            &base.path().join("gone").join("SUB").join("x.txt"),
+            &root
+        ));
+        assert!(!super::path_is_under_confine_root(
+            &base.path().join("gone").join("SUB-evil").join("x.txt"),
+            &root
+        ));
+    }
+
+    /// A `..` in the not-yet-existing tail can step back into directories that
+    /// do exist. What follows it must be resolved like any other component, or
+    /// `root/missing/../link/x` is judged lexically while the write goes
+    /// through the `link` symlink.
+    #[cfg(unix)]
+    #[test]
+    fn confine_resolves_symlink_reached_through_dotdot_in_missing_tail() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let via_dotdot = root.join("missing").join("..").join("link").join("x.txt");
+        assert!(
+            !super::path_is_under_confine_root(&via_dotdot, &root),
+            "a symlink reached after `..` in a missing tail must be resolved"
+        );
+        assert_eq!(
+            super::canonicalize_for_permission(&via_dotdot).display,
+            dunce::canonicalize(&outside).unwrap().join("x.txt")
+        );
+        let back_through_root = root
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("root")
+            .join("link")
+            .join("y.txt");
+        assert!(!super::path_is_under_confine_root(
+            &back_through_root,
+            &root
+        ));
+        assert!(super::path_is_under_confine_root(
+            &root.join("missing").join("..").join("new.txt"),
+            &root
+        ));
+    }
+
+    /// A temporary directory made case-sensitive with `fsutil`, created in
+    /// `TURBO_CASE_SENSITIVE_TEST_DIR` when that is set and in the system temp
+    /// directory otherwise. The caller proves a security property, so a host
+    /// that cannot set the flag fails the test; `None` means the operator opted
+    /// out with `TURBO_ALLOW_CASE_SENSITIVE_SKIP=1`.
+    #[cfg(windows)]
+    fn case_sensitive_tempdir_or_skip() -> Option<tempfile::TempDir> {
+        let dir = match std::env::var_os("TURBO_CASE_SENSITIVE_TEST_DIR") {
+            Some(parent) => tempfile::tempdir_in(&parent).unwrap_or_else(|e| {
+                panic!(
+                    "cannot create a directory in TURBO_CASE_SENSITIVE_TEST_DIR `{}`: {e}",
+                    std::path::Path::new(&parent).display()
+                )
+            }),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let failure = match std::process::Command::new("fsutil")
+            .args(["file", "setCaseSensitiveInfo"])
+            .arg(dir.path())
+            .arg("enable")
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                assert_eq!(
+                    super::dir_case_sensitivity(dir.path()),
+                    Some(true),
+                    "fsutil reported success, but `{}` does not read back as case-sensitive",
+                    dir.path().display()
+                );
+                return Some(dir);
+            }
+            Ok(out) => format!(
+                "fsutil exited with {}: {} {}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => format!("fsutil could not be started: {e}"),
+        };
+        if std::env::var("TURBO_ALLOW_CASE_SENSITIVE_SKIP").as_deref() == Ok("1") {
+            eprintln!(
+                "SKIPPED (case-sensitive directory): {failure}; TURBO_ALLOW_CASE_SENSITIVE_SKIP=1"
+            );
+            return None;
+        }
+        panic!(
+            "cannot make `{}` case-sensitive ({failure}). This test proves a security property \
+             and must not pass silently. Changing the flag needs the \"Delete subfolders and \
+             files\" permission on the directory, which Modify does not grant, and on some \
+             Windows builds an elevated process: set TURBO_CASE_SENSITIVE_TEST_DIR to a \
+             directory you have Full Control over, such as %LOCALAPPDATA%\\Temp, or set \
+             TURBO_ALLOW_CASE_SENSITIVE_SKIP=1 to skip it explicitly.",
+            dir.path().display()
         );
     }
 

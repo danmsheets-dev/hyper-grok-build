@@ -11,10 +11,10 @@ mod permissions;
 mod prompt;
 mod rewind;
 mod router;
-mod steer;
 mod session;
 mod settings;
 mod status;
+mod steer;
 mod task_result;
 mod transcript;
 mod turn;
@@ -272,6 +272,7 @@ fn test_app() -> AppView {
         has_external_auth_provider: false,
         tier_restricted_commands: Vec::new(),
         leader_mode: true,
+        codex_quota: crate::app::codex_quota::CodexQuotaState::default(),
         credit_balance: None,
         auto_topup: None,
         billing_poll_wanted: false,
@@ -336,6 +337,10 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        model_switch_generation: 0,
+        pending_model_switch: None,
+        queued_model_switch: None,
+        pending_model_switch_confirmation: None,
         user_model_preference: None,
         deferred_model_switch: app.deferred_model_switch_from_cli(),
         bg_tasks: std::collections::BTreeMap::new(),
@@ -357,6 +362,46 @@ pub(super) fn test_app_with_agent() -> AppView {
     app.next_agent_id = 1;
     switch_to_agent(&mut app, id, SwitchCause::New);
     app
+}
+
+pub(super) fn begin_test_model_switch(
+    app: &mut AppView,
+    model_id: acp::ModelId,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+) -> Effect {
+    let mut effects = dispatch(Action::SwitchModel { model_id, effort }, app);
+    assert_eq!(
+        effects.len(),
+        1,
+        "expected one serialized switch effect: {effects:?}"
+    );
+    effects.remove(0)
+}
+
+pub(super) fn switch_completion(
+    effect: Effect,
+    result: Result<(), SwitchModelError>,
+) -> TaskResult {
+    let Effect::SwitchModel {
+        agent_id,
+        session_id,
+        generation,
+        model_id,
+        effort,
+        prev_model_id,
+    } = effect
+    else {
+        panic!("expected SwitchModel effect");
+    };
+    TaskResult::SwitchModelComplete {
+        agent_id,
+        session_id,
+        generation,
+        model_id,
+        effort,
+        result,
+        prev_model_id,
+    }
 }
 /// Give a test agent a generated title so the dashboard renders it.
 ///
@@ -587,6 +632,10 @@ fn insert_placeholder_agent(app: &mut AppView, id: AgentId) {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
@@ -732,6 +781,10 @@ fn two_agent_app_with_bg_task() -> AppView {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

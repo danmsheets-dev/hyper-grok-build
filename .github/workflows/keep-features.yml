@@ -59,8 +59,44 @@ jobs:
           cargo test -p xai-grok-meeting-bot --lib -- --test-threads=2
           cargo test -p xai-grok-cdp --lib -- --test-threads=2
 
+      - name: MCP server containment boundary
+        run: |
+          # The grep tests need a real ripgrep; debug builds do not bundle one.
+          sudo apt-get update && sudo apt-get install -y ripgrep
+          rg --version
+          cargo test -p xai-grok-mcp-server --lib -- --test-threads=2
+          cargo test -p xai-grok-pager --lib mcp_serve_cmd -- --test-threads=2
+
       - name: Agent reporting (ADL/FRL + tools schema)
         run: |
           cargo test -p xai-grok-developer-log --lib -- --test-threads=2
           cargo test -p xai-grok-agent --lib boot_card -- --test-threads=2
           cargo test -p xai-grok-pager --lib tools_cmd -- --test-threads=2
+
+  # The session-folder DACL, junction and letter-case tests only run on Windows.
+  mcp-server-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: "1.93.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: keep-features-windows
+
+      # Same protoc launcher the Linux job needs.
+      - name: Install dotslash (protoc launcher)
+        run: cargo install dotslash --version 0.5.7 --locked
+
+      - name: MCP server containment boundary (Windows)
+        shell: bash
+        run: |
+          choco install ripgrep -y --no-progress
+          rg --version
+          cargo test -p xai-grok-mcp-server --lib -- --test-threads=2

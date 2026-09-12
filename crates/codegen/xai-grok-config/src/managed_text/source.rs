@@ -250,6 +250,9 @@ pub(super) struct FileIdentity {
 }
 
 impl FileIdentity {
+    // Non-Windows only. Every Windows call site builds the identity from a
+    // handle or a path instead, so on Windows this would be dead code.
+    #[cfg(not(windows))]
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {

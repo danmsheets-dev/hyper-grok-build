@@ -5,7 +5,7 @@
 //! frontmatter parsing) used by both startup and dynamic discovery.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use super::skill::extract_skill_body;
@@ -571,15 +571,17 @@ pub fn parse_skill_frontmatter(
 
 pub fn read_frontmatter_only(path: &Path) -> std::io::Result<(String, usize)> {
     let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
+    // One byte past the limit is enough to see a front matter run over it, so a
+    // file that is one long line is never read into memory whole.
+    let mut reader = BufReader::new(file).take(MAX_FRONTMATTER_BYTES as u64 + 1);
     let mut frontmatter = String::new();
     let mut total_bytes = 0usize;
     let mut found_opening = false;
-    let mut line_buf = String::new();
+    let mut line_bytes = Vec::new();
 
     loop {
-        line_buf.clear();
-        let bytes_read = reader.read_line(&mut line_buf)?;
+        line_bytes.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line_bytes)?;
         if bytes_read == 0 {
             break;
         }
@@ -587,17 +589,20 @@ pub fn read_frontmatter_only(path: &Path) -> std::io::Result<(String, usize)> {
         if total_bytes > MAX_FRONTMATTER_BYTES {
             break;
         }
+        // Checked after the limit: the last read can end inside a character.
+        let line_buf = std::str::from_utf8(&line_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let trimmed = line_buf.trim();
         if !found_opening {
             if trimmed == "---" {
                 found_opening = true;
-                frontmatter.push_str(&line_buf);
+                frontmatter.push_str(line_buf);
             } else if !trimmed.is_empty() {
                 break;
             }
         } else {
-            frontmatter.push_str(&line_buf);
+            frontmatter.push_str(line_buf);
             if trimmed == "---" {
                 return Ok((frontmatter, total_bytes));
             }
@@ -662,6 +667,33 @@ fn extract_lead_block(body: &str, include_headings: bool) -> Option<String> {
         }
     }
     None
+}
+
+/// Most bytes of a skill file read to take a description from its body.
+const MAX_DESCRIPTION_SOURCE_BYTES: u64 = 64 * 1024;
+
+/// The start of the skill file at `path`, at most
+/// [`MAX_DESCRIPTION_SOURCE_BYTES`] of it: only the start of a body ever becomes
+/// a description. `None` when it cannot be read or is not UTF-8, apart from a
+/// character cut at the limit.
+fn read_description_source(path: &Path) -> Option<String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_DESCRIPTION_SOURCE_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        // Cut inside a character at the limit: keep what came before it.
+        Err(error) if error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()
+        }
+        Err(_) => None,
+    }
 }
 
 /// Parse a list of `(path, scope)` pairs into `SkillInfo` values.
@@ -763,8 +795,8 @@ pub fn parse_skill_files(skill_files: Vec<(PathBuf, SkillScope)>) -> Vec<SkillIn
             }
 
             if parsed.description.is_empty() {
-                if let Ok(full) = std::fs::read_to_string(&path) {
-                    let body = extract_skill_body(&full);
+                if let Some(start) = read_description_source(&path) {
+                    let body = extract_skill_body(&start);
                     let peek = if body.len() > MAX_BODY_PEEK_BYTES {
                         let end = crate::util::floor_char_boundary(&body, MAX_BODY_PEEK_BYTES);
                         &body[..end]
@@ -1611,5 +1643,47 @@ model: test-model
                 "zeta/SKILL.md"
             ]
         );
+    }
+
+    #[test]
+    fn read_frontmatter_only_never_reads_past_its_limit() {
+        // A skill file that is one long line is not read into memory whole.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        let long_line = "x".repeat(4 * 1024 * 1024);
+        std::fs::write(&path, format!("---\nname: long\n{long_line}\n---\n")).unwrap();
+        let (frontmatter, read) = read_frontmatter_only(&path).unwrap();
+        assert!(read <= MAX_FRONTMATTER_BYTES + 1, "read {read} bytes");
+        assert_eq!(frontmatter, "---\nname: long\n");
+    }
+
+    #[test]
+    fn read_frontmatter_only_treats_a_cut_character_as_an_overlong_front_matter() {
+        // The limit falls inside a two-byte character in one of these files.
+        // Either way the front matter is too long, which is not an error.
+        let tmp = tempfile::tempdir().unwrap();
+        let value = "\u{e9}".repeat(MAX_FRONTMATTER_BYTES);
+        for (i, key) in ["description: ", "description: a"].iter().enumerate() {
+            let path = tmp.path().join(format!("{i}.md"));
+            std::fs::write(&path, format!("---\n{key}{value}\n---\n")).unwrap();
+            let (frontmatter, _) = read_frontmatter_only(&path).unwrap();
+            assert_eq!(frontmatter, "---\n");
+        }
+    }
+
+    #[test]
+    fn a_description_from_the_body_reads_only_the_start_of_the_skill_file() {
+        // Only the start of a body becomes a description. A byte that is not
+        // UTF-8 far past that start leaves the description alone, which shows
+        // the rest of the file was never read.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("big");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut content = b"---\nname: big\n---\n\nThe first paragraph.\n\n".to_vec();
+        content.extend(std::iter::repeat_n(b'x', 200_000));
+        content.push(0xFF);
+        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+        let mut skills = parse_skill_files(vec![(dir.join("SKILL.md"), SkillScope::Local)]);
+        assert_eq!(skills.pop().unwrap().description, "The first paragraph.");
     }
 }

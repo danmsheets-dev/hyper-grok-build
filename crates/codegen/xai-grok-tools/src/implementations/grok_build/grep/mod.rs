@@ -17,8 +17,8 @@ use crate::DEFAULT_TOOL_OUTPUT_BYTES;
 use crate::types::output::{GrepFileMatch, GrepLineMatch, GrepSearchOutput};
 #[allow(unused_imports)]
 use crate::types::resources::{
-    Cwd, DenyReadGlobs, DisplayCwd, Params, PathNotFoundHints, SharedResources, display_cwd_or_cwd,
-    resolve_model_path,
+    Cwd, DenyReadGlobs, DisplayCwd, Params, PathNotFoundHints, ServedGrepPolicy, SharedResources,
+    display_cwd_or_cwd, resolve_model_path,
 };
 use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::util::truncate::truncate_line;
@@ -348,6 +348,7 @@ impl xai_tool_runtime::Tool for GrepTool {
             mut child,
             stdout_pipe,
             stderr_pipe,
+            mut result_filter,
             config,
         } = match prepare_grep(&ctx, &input).await? {
             GrepStep::Ready(ready) => ready,
@@ -377,8 +378,12 @@ impl xai_tool_runtime::Tool for GrepTool {
             // never flag truncation when there are exactly `effective_head_limit`
             // lines — matching `finalize_grep`'s `> limit` check.
             let (stdout_buf, stdout_truncated) = if let Some(stdout_pipe) = stdout_pipe {
-                read_rg_stdout_capped(stdout_pipe, config.effective_head_limit.saturating_add(1))
-                    .await
+                read_rg_stdout_capped(
+                    stdout_pipe,
+                    config.effective_head_limit.saturating_add(1),
+                    result_filter.as_mut(),
+                )
+                .await
             } else {
                 (Vec::new(), false)
             };
@@ -429,6 +434,8 @@ impl xai_tool_runtime::Tool for GrepTool {
         } else {
             child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
         };
+        let (stdout_buf, stderr_buf, exit_code) =
+            served_outcome(result_filter.is_some(), stdout_buf, stderr_buf, exit_code);
 
         tracing::Span::current().record("early_kill", stdout_truncated);
         tracing::Span::current().record("wall_ms", started.elapsed().as_millis() as u64);
@@ -464,6 +471,7 @@ fn grep_progress_stream(
             mut child,
             stdout_pipe,
             stderr_pipe,
+            mut result_filter,
             config,
         } = match prepare_grep(&ctx, &input).await {
             Ok(GrepStep::Ready(ready)) => ready,
@@ -501,6 +509,9 @@ fn grep_progress_stream(
         // Complete newlines accepted into `stdout_buf` (same budget as
         // `read_rg_stdout_capped` / `finalize_grep`).
         let mut complete_lines = 0usize;
+        // Set when rg's stdout ended on its own, so a filter's held-back final
+        // line still gets flushed.
+        let mut reached_eof = false;
         // One deadline shared by stdout loop + stderr drain (same total
         // budget as `run`).
         let timeout = grep_timeout();
@@ -520,9 +531,17 @@ fn grep_progress_stream(
                     }
                     res = stdout_pipe.read(&mut tmp) => {
                         let n = match res {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => {
+                                reached_eof = true;
+                                break;
+                            }
                             Ok(n) => n,
-                            Err(_) => break,
+                        };
+                        // Served grep: drop refused files' results before any
+                        // budget counts them.
+                        let chunk: std::borrow::Cow<'_, [u8]> = match result_filter.as_mut() {
+                            Some(filter) => std::borrow::Cow::Owned(filter.feed(&tmp[..n])),
+                            None => std::borrow::Cow::Borrowed(&tmp[..n]),
                         };
                         // Mirror `run`'s hard byte + line caps when filling
                         // `stdout_buf`, then kill so rg stops walking the tree.
@@ -532,17 +551,17 @@ fn grep_progress_stream(
                         // `finalize_grep`). The extra line is dropped by
                         // `BodyStreamer`/`finalize_grep`, never emitted.
                         let (accepted, hit_cap) = accept_rg_stdout_chunk(
-                            &tmp[..n],
+                            &chunk,
                             stdout_buf.len(),
                             complete_lines,
                             config.effective_head_limit.saturating_add(1),
                         );
                         if accepted > 0 {
-                            complete_lines += tmp[..accepted]
+                            complete_lines += chunk[..accepted]
                                 .iter()
                                 .filter(|&&b| b == b'\n')
                                 .count();
-                            stdout_buf.extend_from_slice(&tmp[..accepted]);
+                            stdout_buf.extend_from_slice(&chunk[..accepted]);
                         }
 
                         // Project + emit each newly completed line BEFORE the
@@ -551,9 +570,12 @@ fn grep_progress_stream(
                         // it would stream corrupted data (the terminal card is
                         // rebuilt from `stdout_buf`, but streamed deltas must
                         // stay a faithful prefix of it).
-                        for p in streamer.feed(&tmp[..accepted]) {
+                        for p in streamer.feed(&chunk[..accepted]) {
                             yield xai_tool_runtime::ToolStreamItem::Progress(p);
                         }
+                        let chunk_len = chunk.len();
+                        // Release the borrow of `tmp` before the probe reuses it.
+                        drop(chunk);
 
                         if hit_cap {
                             // Same short exact-fit probe as `read_rg_stdout_capped`.
@@ -562,23 +584,18 @@ fn grep_progress_stream(
                             // and setting `timed_out` on expiry would force the
                             // timeout terminal branch (banner, exit -1) for a
                             // normal head-limit fill near the wall-clock edge.
-                            if accepted < n {
+                            if accepted < chunk_len {
                                 stdout_truncated = true;
                             } else {
-                                match tokio::time::timeout(
-                                    EXACT_FIT_PROBE_TIMEOUT,
-                                    stdout_pipe.read(&mut tmp),
+                                // Probe budget only: head-limit truncation path
+                                // (keep buffer, kill `rg` below). Never set
+                                // `timed_out` here.
+                                stdout_truncated = probe_more_output(
+                                    &mut stdout_pipe,
+                                    &mut tmp,
+                                    result_filter.as_mut(),
                                 )
-                                .await
-                                {
-                                    Ok(Ok(0)) => stdout_truncated = false,
-                                    Ok(Ok(_)) => stdout_truncated = true,
-                                    Ok(Err(_)) => stdout_truncated = true,
-                                    // Probe budget only: head-limit truncation path
-                                    // (keep buffer, kill `rg` below). Never set
-                                    // `timed_out` here.
-                                    Err(_elapsed) => stdout_truncated = true,
-                                }
+                                .await;
                             }
                         }
 
@@ -593,6 +610,27 @@ fn grep_progress_stream(
                         }
                     }
                 }
+            }
+        }
+
+        // A served grep's filter holds back an unterminated final line until EOF.
+        if reached_eof
+            && !stdout_truncated
+            && let Some(filter) = result_filter.as_mut()
+        {
+            let tail = filter.finish();
+            let (accepted, hit_cap) = accept_rg_stdout_chunk(
+                &tail,
+                stdout_buf.len(),
+                complete_lines,
+                config.effective_head_limit.saturating_add(1),
+            );
+            stdout_buf.extend_from_slice(&tail[..accepted]);
+            for p in streamer.feed(&tail[..accepted]) {
+                yield xai_tool_runtime::ToolStreamItem::Progress(p);
+            }
+            if hit_cap && accepted < tail.len() {
+                stdout_truncated = true;
             }
         }
 
@@ -665,6 +703,8 @@ fn grep_progress_stream(
         } else {
             child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
         };
+        let (stdout_buf, stderr_buf, exit_code) =
+            served_outcome(result_filter.is_some(), stdout_buf, stderr_buf, exit_code);
 
         let wall_ms = stream_started.elapsed().as_millis() as u64;
         span.record("early_kill", stdout_truncated);
@@ -745,6 +785,8 @@ struct GrepReady {
     child: Child,
     stdout_pipe: Option<ChildStdout>,
     stderr_pipe: Option<ChildStderr>,
+    /// Present when a [`ServedGrepPolicy`] is installed.
+    result_filter: Option<RgResultFilter>,
     config: GrepFormatConfig,
 }
 
@@ -765,7 +807,7 @@ async fn prepare_grep(
     use crate::types::tool_metadata::{resolve_cwd, shared_resources};
     let resources = shared_resources(ctx)?;
     let cwd = resolve_cwd(ctx, &resources).await?;
-    let (display_cwd, hints_enabled, deny_read_globs) = {
+    let (display_cwd, hints_enabled, deny_read_globs, served_policy) = {
         let res = resources.lock().await;
         (
             res.get::<DisplayCwd>().map(|d| d.0.clone()),
@@ -773,6 +815,7 @@ async fn prepare_grep(
             res.get::<DenyReadGlobs>()
                 .map(|d| d.0.clone())
                 .unwrap_or_default(),
+            res.get::<ServedGrepPolicy>().cloned(),
         )
     };
 
@@ -854,6 +897,11 @@ async fn prepare_grep(
         cmd.arg("--glob").arg(format!("!{deny}"));
     }
 
+    let served = served_policy.is_some();
+    if served {
+        apply_served_policy(&mut cmd);
+    }
+
     if let Some(t) = &input.r#type
         && !t.is_empty()
     {
@@ -914,12 +962,18 @@ async fn prepare_grep(
             // spawn reason solely in stderr produced a silent empty body on
             // Windows when `CreateProcess` rejected an extensionless bundled
             // `rg` PE — the failure completed in ~2 ms with no matches and no
-            // explanation. Always put the reason in stdout.
-            let msg = format!(
-                "Error calling tool: failed to spawn ripgrep ({}): {}",
-                rg_exec.display(),
-                e
-            );
+            // explanation. Always put the reason in stdout. A served client is
+            // told only that the search could not start: where ripgrep is
+            // installed names the operator's home and account.
+            let msg = if served {
+                "Error calling tool: the search could not be started".to_string()
+            } else {
+                format!(
+                    "Error calling tool: failed to spawn ripgrep ({}): {}",
+                    rg_exec.display(),
+                    e
+                )
+            };
             tracing::warn!(
                 error = %e,
                 rg = %rg_exec.display(),
@@ -956,10 +1010,13 @@ async fn prepare_grep(
         .max_output_bytes
         .unwrap_or(DEFAULT_TOOL_OUTPUT_BYTES);
 
+    let result_filter =
+        served_policy.map(|policy| RgResultFilter::new(policy.allow_file, output_mode.clone()));
     Ok(GrepStep::Ready(GrepReady {
         child,
         stdout_pipe,
         stderr_pipe,
+        result_filter,
         config: GrepFormatConfig {
             output_mode,
             effective_head_limit,
@@ -1039,48 +1096,736 @@ fn accept_rg_stdout_chunk(
 /// The post-budget "exact-fit" probe is **time-bounded** ([`EXACT_FIT_PROBE_TIMEOUT`]).
 /// An unbounded `read` would hold the outer tool timeout and, on expiry, drop the
 /// already-buffered matches in favor of a timeout error card.
-async fn read_rg_stdout_capped(mut stdout_pipe: ChildStdout, max_lines: usize) -> (Vec<u8>, bool) {
+async fn read_rg_stdout_capped(
+    mut stdout_pipe: ChildStdout,
+    max_lines: usize,
+    mut filter: Option<&mut RgResultFilter>,
+) -> (Vec<u8>, bool) {
     let mut buf = Vec::with_capacity(MAX_STDOUT_BYTES.min(65_536));
     let mut complete_lines = 0usize;
     let mut truncated = false;
     let mut tmp = [0u8; 8192];
+    let mut reached_eof = false;
     loop {
-        match stdout_pipe.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let (accepted, hit_cap) =
-                    accept_rg_stdout_chunk(&tmp[..n], buf.len(), complete_lines, max_lines);
-                if accepted > 0 {
-                    complete_lines += tmp[..accepted].iter().filter(|&&b| b == b'\n').count();
-                    buf.extend_from_slice(&tmp[..accepted]);
-                }
-                if hit_cap {
-                    if accepted < n {
-                        truncated = true;
-                    } else {
-                        // Bounded probe: never wait for the full tool timeout here.
-                        match tokio::time::timeout(
-                            EXACT_FIT_PROBE_TIMEOUT,
-                            stdout_pipe.read(&mut tmp),
-                        )
-                        .await
-                        {
-                            Ok(Ok(0)) => truncated = false,
-                            Ok(Ok(_)) => truncated = true,
-                            Ok(Err(_)) => truncated = true,
-                            // No more data arrived quickly — assume overflow so the
-                            // caller kills `rg` and keeps the buffer (do not escalate
-                            // to the outer timeout path that drops matches).
-                            Err(_elapsed) => truncated = true,
-                        }
-                    }
-                    break;
-                }
+        let n = match stdout_pipe.read(&mut tmp).await {
+            Ok(0) | Err(_) => {
+                reached_eof = true;
+                break;
             }
-            Err(_) => break,
+            Ok(n) => n,
+        };
+        // Served grep: drop refused files' results before any budget counts them.
+        let chunk: std::borrow::Cow<'_, [u8]> = match filter.as_deref_mut() {
+            Some(filter) => std::borrow::Cow::Owned(filter.feed(&tmp[..n])),
+            None => std::borrow::Cow::Borrowed(&tmp[..n]),
+        };
+        let (accepted, hit_cap) =
+            accept_rg_stdout_chunk(&chunk, buf.len(), complete_lines, max_lines);
+        if accepted > 0 {
+            complete_lines += chunk[..accepted].iter().filter(|&&b| b == b'\n').count();
+            buf.extend_from_slice(&chunk[..accepted]);
+        }
+        let chunk_len = chunk.len();
+        // Release the borrow of `tmp` before the probe reuses it.
+        drop(chunk);
+        if hit_cap {
+            if accepted < chunk_len {
+                truncated = true;
+            } else {
+                // Bounded probe: never wait for the full tool timeout here. No
+                // more data arriving quickly counts as overflow, so the caller
+                // kills `rg` and keeps the buffer (do not escalate to the outer
+                // timeout path that drops matches).
+                truncated =
+                    probe_more_output(&mut stdout_pipe, &mut tmp, filter.as_deref_mut()).await;
+            }
+            break;
+        }
+    }
+    if reached_eof
+        && !truncated
+        && let Some(filter) = filter
+    {
+        let tail = filter.finish();
+        let (accepted, hit_cap) =
+            accept_rg_stdout_chunk(&tail, buf.len(), complete_lines, max_lines);
+        buf.extend_from_slice(&tail[..accepted]);
+        if hit_cap && accepted < tail.len() {
+            truncated = true;
         }
     }
     (buf, truncated)
+}
+
+/// After the line budget is full, whether more output follows. Without a
+/// filter, any byte counts. With one, only output the filter keeps counts, so a
+/// refused file after the budget cannot turn "N matches" into "at least N".
+/// Bounded by [`EXACT_FIT_PROBE_TIMEOUT`] overall; running out of time counts
+/// as more output.
+async fn probe_more_output(
+    stdout_pipe: &mut ChildStdout,
+    tmp: &mut [u8],
+    mut filter: Option<&mut RgResultFilter>,
+) -> bool {
+    let probe = async {
+        loop {
+            match stdout_pipe.read(tmp).await {
+                Ok(0) => {
+                    return filter
+                        .as_deref_mut()
+                        .is_some_and(|filter| !filter.finish().is_empty());
+                }
+                Ok(n) => match filter.as_deref_mut() {
+                    None => return true,
+                    Some(filter) => {
+                        if !filter.feed(&tmp[..n]).is_empty() {
+                            return true;
+                        }
+                    }
+                },
+                Err(_) => return true,
+            }
+        }
+    };
+    tokio::time::timeout(EXACT_FIT_PROBE_TIMEOUT, probe)
+        .await
+        .unwrap_or(true)
+}
+
+/// Harden ripgrep for a search served to an untrusted client. The operator's
+/// ripgrep config file could add `--follow`, which walks symlinks past every
+/// name-based exclude, or a preprocessor, so it is ignored; symlinks are never
+/// followed; every printed path ends in a NUL byte, so a name holding a newline
+/// cannot pass for a path and a numbered line; ripgrep's messages about files it
+/// could not read and ignore files it could not parse are off, since they name
+/// files the result filter never judges; and the process dies with an
+/// abandoned search.
+fn apply_served_policy(cmd: &mut Command) {
+    cmd.arg("--no-config")
+        .arg("--no-follow")
+        .arg("--null")
+        .arg("--no-messages")
+        .arg("--no-ignore-messages");
+    cmd.env_remove("RIPGREP_CONFIG_PATH");
+    cmd.kill_on_drop(true);
+}
+
+/// Longest path the result filter waits for. ripgrep prints nothing longer, so
+/// output without a NUL by then is not a path, and the block after it is dropped.
+const MAX_PRINTED_PATH_BYTES: usize = 64 * 1024;
+
+/// Drops ripgrep result blocks for files a [`ServedGrepPolicy`] refuses.
+///
+/// Applied to raw rg stdout before any line or byte budget is counted, so a
+/// dropped block never shows up in counts, truncation markers or the streamed
+/// body. A served search runs ripgrep with `--null`, so each path is read whole,
+/// up to its NUL, and judged exactly as printed. The kept output is written back
+/// in the newline form [`parse_file_matches`] reads.
+///
+/// Nothing in the kept output may show that a block was dropped. ripgrep writes
+/// a blank line before each file after the first, so a separator is held back
+/// and written only before the next kept file, never after the last one.
+struct RgResultFilter {
+    allow_file: std::sync::Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>,
+    mode: OutputMode,
+    /// Bytes not yet parsed, carried to the next feed.
+    pending: Vec<u8>,
+    /// Content mode: whether the current file block is kept; `None` while a
+    /// path is expected.
+    block: Option<bool>,
+    /// Content mode: a file separator waiting for the next kept block.
+    held_separator: bool,
+    /// Content mode: whether any block has been kept yet.
+    kept_any: bool,
+    /// Content mode: output too long to be a path is being skipped up to its NUL.
+    skipping_path: bool,
+}
+
+impl RgResultFilter {
+    fn new(
+        allow_file: std::sync::Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>,
+        mode: OutputMode,
+    ) -> Self {
+        Self {
+            allow_file,
+            mode,
+            pending: Vec::new(),
+            block: None,
+            held_separator: false,
+            kept_any: false,
+            skipping_path: false,
+        }
+    }
+
+    /// Filter a raw chunk; returns the kept output, in newline form.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        let buf = std::mem::take(&mut self.pending);
+        let mut out = Vec::new();
+        let used = match self.mode {
+            OutputMode::FilesWithMatches => self.parse_paths(&buf, &mut out),
+            OutputMode::Count => self.parse_counts(&buf, &mut out),
+            OutputMode::Content => self.parse_content(&buf, &mut out),
+        };
+        self.pending.extend_from_slice(&buf[used..]);
+        out
+    }
+
+    /// Output ripgrep left unterminated at its end. A last line inside a kept
+    /// block is kept, and so is the notice ripgrep prints alone for a named
+    /// binary file; a path that never reached its NUL, and a held separator, are
+    /// dropped, since ripgrep ends its output with neither.
+    fn finish(&mut self) -> Vec<u8> {
+        let rest = std::mem::take(&mut self.pending);
+        let mut out = Vec::new();
+        if matches!(self.mode, OutputMode::Content) && !rest.is_empty() {
+            if self.block.is_some() {
+                self.push_block_line(&rest, &mut out);
+            } else if !self.skipping_path {
+                self.push_binary_notice(&rest, &mut out);
+            }
+        }
+        self.held_separator = false;
+        out
+    }
+
+    /// A search of one named binary file prints only a notice naming it, with no
+    /// NUL: `<path>: binary file matches (...)`. Nothing can follow it, so a name
+    /// that merely holds that text cannot split into a judged path and an
+    /// unjudged rest.
+    fn push_binary_notice(&self, rest: &[u8], out: &mut Vec<u8>) {
+        const NOTICE: &[u8] = b": binary file matches (";
+        let line = rest.strip_suffix(b"\n").unwrap_or(rest);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.contains(&b'\n') || !line.ends_with(b")") {
+            return;
+        }
+        let Some(at) = line
+            .windows(NOTICE.len())
+            .rposition(|window| window == NOTICE)
+        else {
+            return;
+        };
+        if self.judge(&line[..at]) {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+
+    /// `--files-with-matches`: one NUL-terminated path per file.
+    fn parse_paths(&mut self, buf: &[u8], out: &mut Vec<u8>) -> usize {
+        let mut start = 0;
+        while let Some(nul) = find_byte(buf, start, 0) {
+            let path = &buf[start..nul];
+            if self.judge(path) {
+                out.extend_from_slice(path);
+                out.push(b'\n');
+            }
+            start = nul + 1;
+        }
+        start
+    }
+
+    /// `--count`: a NUL-terminated path, then the count and a newline.
+    fn parse_counts(&mut self, buf: &[u8], out: &mut Vec<u8>) -> usize {
+        let mut start = 0;
+        while let Some(nul) = find_byte(buf, start, 0)
+            && let Some(end) = find_byte(buf, nul + 1, b'\n')
+        {
+            let path = &buf[start..nul];
+            let count = &buf[nul + 1..end];
+            let numeric =
+                std::str::from_utf8(count).is_ok_and(|count| count.trim().parse::<usize>().is_ok());
+            if numeric && self.judge(path) {
+                out.extend_from_slice(path);
+                out.push(b':');
+                out.extend_from_slice(count);
+                out.push(b'\n');
+            }
+            start = end + 1;
+        }
+        start
+    }
+
+    /// Content mode with `--heading`: a NUL-terminated path, then that file's
+    /// lines, then a blank line before the next file.
+    fn parse_content(&mut self, buf: &[u8], out: &mut Vec<u8>) -> usize {
+        let mut start = 0;
+        while start < buf.len() {
+            if self.skipping_path {
+                let Some(nul) = find_byte(buf, start, 0) else {
+                    return buf.len();
+                };
+                self.skipping_path = false;
+                self.block = Some(false);
+                start = nul + 1;
+                continue;
+            }
+            if self.block.is_some() {
+                let Some(newline) = find_byte(buf, start, b'\n') else {
+                    break;
+                };
+                self.push_block_line(&buf[start..=newline], out);
+                start = newline + 1;
+                continue;
+            }
+            // Between files: the blank separator, or the next path up to its NUL.
+            if buf[start] == b'\n' {
+                self.held_separator = true;
+                start += 1;
+                continue;
+            }
+            if buf[start..].starts_with(b"\r\n") {
+                self.held_separator = true;
+                start += 2;
+                continue;
+            }
+            let Some(nul) = find_byte(buf, start, 0) else {
+                if buf.len() - start > MAX_PRINTED_PATH_BYTES {
+                    self.skipping_path = true;
+                    return buf.len();
+                }
+                break;
+            };
+            let path = &buf[start..nul];
+            let kept = self.judge(path);
+            self.block = Some(kept);
+            if kept {
+                if self.kept_any && self.held_separator {
+                    out.push(b'\n');
+                }
+                self.kept_any = true;
+                self.held_separator = false;
+                out.extend_from_slice(path);
+                out.push(b'\n');
+            }
+            start = nul + 1;
+        }
+        start
+    }
+
+    /// One line inside a file block, newline included.
+    fn push_block_line(&mut self, raw: &[u8], out: &mut Vec<u8>) {
+        let kept = self.block.unwrap_or(false);
+        let text = String::from_utf8_lossy(raw);
+        let line = text.trim_end_matches(['\n', '\r']);
+        let keep = if line.trim().is_empty() {
+            // A blank line ends the block; the next file's path follows.
+            self.block = None;
+            self.held_separator = true;
+            false
+        } else if line.trim() == "--" || parse_numbered_line_prefix(line).is_some() {
+            kept
+        } else {
+            // Inside a block ripgrep writes numbered lines and `--`. Anything
+            // else, such as a binary-file notice that names the file, may narrow
+            // what is kept but never re-opens a refused block.
+            let narrowed = kept && self.judge(line.trim().as_bytes());
+            self.block = Some(narrowed);
+            narrowed
+        };
+        if keep {
+            out.extend_from_slice(raw);
+        }
+    }
+
+    /// Whether results from `path`, exactly as ripgrep printed it, may be shown.
+    fn judge(&self, path: &[u8]) -> bool {
+        // A path that is not valid UTF-8 cannot be judged: its lossy decoding
+        // names a different, nonexistent file. On Windows ripgrep decodes an
+        // undecodable name itself and prints U+FFFD, so there a path holding one
+        // is refused too. Elsewhere ripgrep prints raw bytes, and U+FFFD is an
+        // ordinary character in a name.
+        let Ok(path) = std::str::from_utf8(path) else {
+            return false;
+        };
+        if cfg!(windows) && path.contains('\u{FFFD}') {
+            return false;
+        }
+        // The reply is read line by line, so a path holding a line break would
+        // show as another path and a matching line. No client could name it.
+        if path.contains(['\n', '\r']) {
+            return false;
+        }
+        !path.is_empty() && (self.allow_file)(std::path::Path::new(path))
+    }
+}
+
+/// The index of the first `byte` in `buf` at or after `from`.
+fn find_byte(buf: &[u8], from: usize, byte: u8) -> Option<usize> {
+    buf.get(from..)?
+        .iter()
+        .position(|&b| b == byte)
+        .map(|offset| from + offset)
+}
+
+/// With a result filter, ripgrep's exit status still counts files the filter
+/// dropped: it exits 0 when only refused files matched. Judge a filtered search
+/// by the output it kept, so that case reads exactly like no match at all and
+/// the reply cannot tell whether a refused file matched. ripgrep also exits 2
+/// when it could not read some file or parse an ignore file, perhaps one the
+/// filter drops or one outside the root: what it searched stands, and its
+/// standard error is shown only when it is about the search's own pattern, glob
+/// or file type, or about a character its pattern may not hold, each of which
+/// quotes only what the client sent.
+fn served_outcome(
+    filtered: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i32,
+) -> (Vec<u8>, Vec<u8>, i32) {
+    if !filtered {
+        return (stdout, stderr, exit_code);
+    }
+    let kept_nothing = stdout.iter().all(u8::is_ascii_whitespace);
+    match exit_code {
+        0 if kept_nothing => (Vec::new(), Vec::new(), 1),
+        2 if !kept_nothing => (stdout, Vec::new(), 0),
+        2 if !is_search_argument_error(&stderr) => (Vec::new(), Vec::new(), 1),
+        _ => (stdout, stderr, exit_code),
+    }
+}
+
+/// Whether ripgrep's standard error is about the search's own arguments rather
+/// than about a file it met. Each of these quotes only what the client sent.
+fn is_search_argument_error(stderr: &[u8]) -> bool {
+    const PREFIXES: &[&str] = &[
+        "rg: regex parse error",
+        "rg: error parsing glob '",
+        "rg: unrecognized file type",
+        "rg: compiled regex exceeds size limit",
+        // A pattern that could match a line break, without multiline: the
+        // message names the character and says which flag allows it.
+        "rg: the literal ",
+    ];
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim_start();
+    PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod rg_result_filter_tests {
+    use super::*;
+
+    fn refuse_secret(mode: OutputMode) -> RgResultFilter {
+        RgResultFilter::new(
+            std::sync::Arc::new(|path: &std::path::Path| {
+                !path.to_string_lossy().contains("secret")
+            }),
+            mode,
+        )
+    }
+
+    fn allow_all(mode: OutputMode) -> RgResultFilter {
+        RgResultFilter::new(std::sync::Arc::new(|_: &std::path::Path| true), mode)
+    }
+
+    /// Feed raw bytes in pieces of `size`, as pipe reads arrive.
+    fn run_in_pieces(filter: &mut RgResultFilter, raw: &[u8], size: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for piece in raw.chunks(size) {
+            out.extend(filter.feed(piece));
+        }
+        out.extend(filter.finish());
+        out
+    }
+
+    /// Feed `raw` in small uneven pieces, as pipe reads arrive.
+    fn run(filter: &mut RgResultFilter, raw: &str) -> String {
+        String::from_utf8(run_in_pieces(filter, raw.as_bytes(), 5)).unwrap()
+    }
+
+    fn run_bytes(filter: &mut RgResultFilter, raw: &[u8]) -> Vec<u8> {
+        run_in_pieces(filter, raw, 5)
+    }
+
+    #[test]
+    fn content_mode_drops_a_refused_block_with_its_context_and_separators() {
+        let raw =
+            "/r/a.txt\x001:hit\n2-ctx\n\n/r/secret/b\x003:hit\n--\n4:hit\n\n/r/c.txt\x005:hit";
+        let mut filter = refuse_secret(OutputMode::Content);
+        assert_eq!(
+            run(&mut filter, raw),
+            "/r/a.txt\n1:hit\n2-ctx\n\n/r/c.txt\n5:hit"
+        );
+    }
+
+    #[test]
+    fn content_mode_keeps_everything_when_nothing_is_refused() {
+        let raw = "/r/a.txt\x001:hit\n--\n9:hit\n\n/r/c.txt\x005:hit\n";
+        let mut filter = refuse_secret(OutputMode::Content);
+        assert_eq!(
+            run(&mut filter, raw),
+            "/r/a.txt\n1:hit\n--\n9:hit\n\n/r/c.txt\n5:hit\n"
+        );
+    }
+
+    #[test]
+    fn files_and_count_modes_drop_refused_paths() {
+        let mut files = refuse_secret(OutputMode::FilesWithMatches);
+        assert_eq!(
+            run(&mut files, "/r/a.txt\x00/r/secret/b\x00/r/c.txt\x00"),
+            "/r/a.txt\n/r/c.txt\n"
+        );
+        let mut count = refuse_secret(OutputMode::Count);
+        assert_eq!(
+            run(
+                &mut count,
+                "/r/a.txt\x002\n/r/secret/b\x005\nC:\\r\\c.txt\x001\n"
+            ),
+            "/r/a.txt:2\nC:\\r\\c.txt:1\n"
+        );
+    }
+
+    #[test]
+    fn served_policy_ignores_ripgrep_config_and_symlinks_and_ends_paths_with_nul() {
+        let mut cmd = Command::new("rg");
+        apply_served_policy(&mut cmd);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for flag in [
+            "--no-config",
+            "--no-follow",
+            "--null",
+            "--no-messages",
+            "--no-ignore-messages",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "{flag}: {args:?}");
+        }
+        assert!(
+            cmd.as_std()
+                .get_envs()
+                .any(|(key, value)| key == "RIPGREP_CONFIG_PATH" && value.is_none()),
+            "RIPGREP_CONFIG_PATH must be removed from rg's environment"
+        );
+    }
+
+    #[test]
+    fn a_line_inside_a_refused_block_never_reopens_it() {
+        // Only the exact path is refused. ripgrep's binary-file notice names the
+        // file with extra text after it, which on its own would pass the check.
+        let mut filter = RgResultFilter::new(
+            std::sync::Arc::new(|path: &std::path::Path| {
+                path != std::path::Path::new("/r/b/config")
+            }),
+            OutputMode::Content,
+        );
+        let raw = "/r/b/config\x001:token=abc\n\
+                   /r/b/config: WARNING: stopped searching binary file after match (found \"\\0\" byte around offset 40)\n\
+                   2:token=def\n\n/r/a.txt\x003:hit\n";
+        assert_eq!(run(&mut filter, raw), "/r/a.txt\n3:hit\n");
+    }
+
+    #[test]
+    fn a_notice_inside_a_kept_block_is_kept() {
+        let raw =
+            "/r/a.bin\x001:hit\n/r/a.bin: WARNING: stopped searching binary file after match\n";
+        let mut filter = refuse_secret(OutputMode::Content);
+        assert_eq!(
+            run(&mut filter, raw),
+            "/r/a.bin\n1:hit\n/r/a.bin: WARNING: stopped searching binary file after match\n"
+        );
+    }
+
+    #[test]
+    fn paths_that_are_not_utf8_are_refused() {
+        let mut content = allow_all(OutputMode::Content);
+        assert_eq!(
+            run_bytes(
+                &mut content,
+                b"/r/d\xe9p\xf4t/config\x001:url\n\n/r/a.txt\x002:hit\n"
+            ),
+            b"/r/a.txt\n2:hit\n"
+        );
+        let mut files = allow_all(OutputMode::FilesWithMatches);
+        assert_eq!(
+            run_bytes(&mut files, b"/r/d\xe9pot\x00/r/a.txt\x00"),
+            b"/r/a.txt\n"
+        );
+        let mut count = allow_all(OutputMode::Count);
+        assert_eq!(
+            run_bytes(&mut count, b"/r/d\xe9pot\x003\n/r/a.txt\x001\n"),
+            b"/r/a.txt:1\n"
+        );
+    }
+
+    fn outcome(stdout: &[u8], stderr: &[u8], code: i32) -> (Vec<u8>, Vec<u8>, i32) {
+        served_outcome(true, stdout.to_vec(), stderr.to_vec(), code)
+    }
+
+    #[test]
+    fn a_filtered_search_that_kept_nothing_reads_as_no_match() {
+        assert_eq!(outcome(b"", b"", 0), (Vec::new(), Vec::new(), 1));
+        assert_eq!(outcome(b"\n\n", b"", 0), (Vec::new(), Vec::new(), 1));
+        assert_eq!(
+            outcome(b"/r/a.txt\n1:hit\n", b"", 0),
+            (b"/r/a.txt\n1:hit\n".to_vec(), Vec::new(), 0)
+        );
+        assert_eq!(
+            served_outcome(false, Vec::new(), b"rg: x".to_vec(), 2),
+            (Vec::new(), b"rg: x".to_vec(), 2)
+        );
+    }
+
+    #[test]
+    fn a_filtered_search_never_shows_what_ripgrep_says_about_a_file() {
+        // ripgrep exits 2 when it could not read a file or parse an ignore file,
+        // perhaps one outside the root or one the filter drops. The matches it
+        // found stand, and its message is never shown.
+        let message: &[u8] = b"rg: /home/u/.ignore: line 1: error parsing glob 'X['\n";
+        assert_eq!(
+            outcome(b"/r/a.txt\n1:hit\n", message, 2),
+            (b"/r/a.txt\n1:hit\n".to_vec(), Vec::new(), 0)
+        );
+        assert_eq!(outcome(b"", message, 2), (Vec::new(), Vec::new(), 1));
+        // An error in the client's own pattern is the client's to see.
+        let pattern: &[u8] =
+            b"rg: regex parse error:\n    (?:foo()\n    ^\nerror: unclosed group\n";
+        assert_eq!(outcome(b"", pattern, 2), (Vec::new(), pattern.to_vec(), 2));
+        // Every prefix is client-reachable, so each has a case: deleting one
+        // must fail this test rather than read as no match.
+        let glob: &[u8] = b"rg: error parsing glob '{': unclosed alternate group\n";
+        assert_eq!(outcome(b"", glob, 2), (Vec::new(), glob.to_vec(), 2));
+        let file_type: &[u8] = b"rg: unrecognized file type: notalang\n";
+        assert_eq!(
+            outcome(b"", file_type, 2),
+            (Vec::new(), file_type.to_vec(), 2)
+        );
+        let size: &[u8] = b"rg: compiled regex exceeds size limit of 10485760 bytes.\n";
+        assert_eq!(outcome(b"", size, 2), (Vec::new(), size.to_vec(), 2));
+        // Including the one for a pattern that could match a line break, which
+        // says to search again with multiline.
+        let newline: &[u8] = b"rg: the literal \"\\n\" is not allowed in a regex\n\nConsider \
+            enabling multiline mode with the --multiline flag (or -U for short).\n";
+        assert_eq!(outcome(b"", newline, 2), (Vec::new(), newline.to_vec(), 2));
+    }
+
+    #[test]
+    fn a_dropped_block_leaves_no_separator_behind() {
+        // ripgrep writes a blank line before every file after the first. A
+        // dropped file must not leave its separator in the kept output.
+        let mut last = refuse_secret(OutputMode::Content);
+        assert_eq!(
+            run(&mut last, "/r/a.txt\x001:hit\n\n/r/secret/b\x002:hit\n"),
+            "/r/a.txt\n1:hit\n"
+        );
+        let mut first = refuse_secret(OutputMode::Content);
+        assert_eq!(
+            run(&mut first, "/r/secret/b\x002:hit\n\n/r/a.txt\x001:hit\n"),
+            "/r/a.txt\n1:hit\n"
+        );
+        let mut between = refuse_secret(OutputMode::Content);
+        assert_eq!(
+            run(
+                &mut between,
+                "/r/a.txt\x001:hit\n\n/r/secret/b\x002:hit\n\n/r/c.txt\x003:hit\n"
+            ),
+            "/r/a.txt\n1:hit\n\n/r/c.txt\n3:hit\n"
+        );
+    }
+
+    #[test]
+    fn a_replacement_character_in_a_path_is_refused_only_on_windows() {
+        // On Windows ripgrep prints a name it cannot decode with U+FFFD. Elsewhere
+        // it prints the raw bytes, and U+FFFD is an ordinary character in a name.
+        let raw = "/r/d\u{FFFD}pot/config\x001:url\n\n/r/a.txt\x002:hit\n";
+        let expected = if cfg!(windows) {
+            "/r/a.txt\n2:hit\n"
+        } else {
+            "/r/d\u{FFFD}pot/config\n1:url\n\n/r/a.txt\n2:hit\n"
+        };
+        assert_eq!(run(&mut allow_all(OutputMode::Content), raw), expected);
+        let files = if cfg!(windows) {
+            "/r/a.txt\n"
+        } else {
+            "/r/d\u{FFFD}pot\n/r/a.txt\n"
+        };
+        assert_eq!(
+            run(
+                &mut allow_all(OutputMode::FilesWithMatches),
+                "/r/d\u{FFFD}pot\x00/r/a.txt\x00"
+            ),
+            files
+        );
+    }
+
+    #[test]
+    fn a_name_holding_a_line_break_is_never_shown() {
+        // A folder named "mirror\n1:old". Its path ends only at its NUL, so it is
+        // judged whole, and refused: the reply is read line by line, where it
+        // would show as a path and a numbered line, and no client could name it.
+        let judged = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = judged.clone();
+        let mut filter = RgResultFilter::new(
+            std::sync::Arc::new(move |path: &std::path::Path| {
+                seen.lock().unwrap().push(path.to_path_buf());
+                true
+            }),
+            OutputMode::Content,
+        );
+        let raw = "/r/backups/mirror\n1:old/notes\x001:url = public\n\n/r/a.txt\x002:hit\n";
+        assert_eq!(run(&mut filter, raw), "/r/a.txt\n2:hit\n");
+        assert_eq!(
+            judged.lock().unwrap().as_slice(),
+            &[std::path::PathBuf::from("/r/a.txt")]
+        );
+        let mut files = allow_all(OutputMode::FilesWithMatches);
+        assert_eq!(run(&mut files, "/r/cr\r\x00/r/a.txt\x00"), "/r/a.txt\n");
+    }
+
+    #[test]
+    fn the_notice_for_a_named_binary_file_is_kept_when_its_file_is_allowed() {
+        // Searching one named binary file prints only this notice, with no NUL.
+        let notice = "/r/early.bin: binary file matches (found \"\\0\" byte around offset 10)\n";
+        assert_eq!(run(&mut allow_all(OutputMode::Content), notice), notice);
+        let mut refused = RgResultFilter::new(
+            std::sync::Arc::new(|path: &std::path::Path| {
+                path != std::path::Path::new("/r/early.bin")
+            }),
+            OutputMode::Content,
+        );
+        assert_eq!(run(&mut refused, notice), "");
+        // Output that is not that notice is still dropped.
+        assert_eq!(
+            run(
+                &mut allow_all(OutputMode::Content),
+                "/r/early.bin: something else\n"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_path_split_across_reads_is_judged_whole() {
+        let raw = b"/r/some/longer/path.txt\x001:hit\n\n/r/secret/b\x002:hit\n";
+        for size in [1, 2, 3, 7] {
+            let mut filter = refuse_secret(OutputMode::Content);
+            assert_eq!(
+                run_in_pieces(&mut filter, raw, size),
+                b"/r/some/longer/path.txt\n1:hit\n",
+                "pieces of {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_that_never_ends_a_path_is_dropped() {
+        // A path cut off at the end of the output is never judged.
+        let mut cut = allow_all(OutputMode::Content);
+        assert_eq!(
+            run(&mut cut, "/r/a.txt\x001:hit\n\n/r/b"),
+            "/r/a.txt\n1:hit\n"
+        );
+        // Output too long to be a path is skipped to its NUL, and the block after
+        // it is dropped, without buffering it.
+        let mut long = allow_all(OutputMode::Content);
+        let mut raw = "x".repeat(MAX_PRINTED_PATH_BYTES + 5000).into_bytes();
+        raw.extend_from_slice(b"\x001:after\n\n/r/a.txt\x002:hit\n");
+        assert_eq!(run_in_pieces(&mut long, &raw, 4096), b"/r/a.txt\n2:hit\n");
+    }
 }
 
 /// Terminal card for a grep that exceeded its wall-clock timeout. Shared by the

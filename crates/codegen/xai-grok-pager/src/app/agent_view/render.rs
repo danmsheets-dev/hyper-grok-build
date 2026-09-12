@@ -2630,14 +2630,22 @@ impl AgentView {
         }
         let mode_flags: &[PromptFlag] = &mode_flags_vec;
         let multiline = self.multiline_mode;
-        let warning = self.credit_balance.as_ref().and_then(|bal| {
-            crate::views::credit_bar::usage_warning_for_session(
-                bal,
-                self.auto_topup.as_ref(),
-                self.billing_surface_visible,
-                self.chat_kind,
-            )
-        });
+        let warning = match crate::app::codex_quota::allowance_provider(Some(&model_id)) {
+            crate::app::codex_quota::AllowanceProvider::Codex => {
+                crate::app::codex_quota::warning(self.codex_quota.as_ref())
+            }
+            crate::app::codex_quota::AllowanceProvider::Xai => {
+                self.credit_balance.as_ref().and_then(|bal| {
+                    crate::views::credit_bar::usage_warning_for_session(
+                        bal,
+                        self.auto_topup.as_ref(),
+                        self.billing_surface_visible,
+                        self.chat_kind,
+                    )
+                })
+            }
+            crate::app::codex_quota::AllowanceProvider::Unsupported(_) => None,
+        };
         let usage_warning_text: Option<String> = warning.as_ref().map(|(t, _)| t.clone());
         let usage_warning = usage_warning_text.as_deref();
         let usage_warning_critical = warning.is_some_and(|(_, critical)| critical);

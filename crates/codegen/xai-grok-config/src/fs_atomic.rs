@@ -67,7 +67,7 @@ pub fn write_atomically(
     let result = options
         .open(&tmp)
         .and_then(|mut f| f.write_all(contents.as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, &final_path));
+        .and_then(|()| std::fs::rename(&tmp, final_path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }

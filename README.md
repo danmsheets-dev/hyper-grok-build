@@ -237,6 +237,7 @@ Not affiliated with xAI. Based on Apache-2.0 Grok Build source.
 | **`/meeting` notetaker** | **Joins Teams as a guest bot** ("Turbo (Notetaker)" in the lobby); in-page audio tap → xAI hosted STT; coworker `Turbo:` Q&A on workspace-confined reads; work-only recap in `Meetings/` | **1.0-rc.4** / v3 **1.0-rc.9** |
 | **`/schedule`** | Standing jobs (search / stat / meeting join); no 7-day expiry; `turbo schedule list` | **1.0-rc.8** |
 | **GitHub log sync** | Opt-in `turbo issues sync` / `turbo features sync` to a private Issues repo | **1.0-rc.8** |
+| **`turbo mcp serve`** | Turbo *as* an MCP server: bounded file tools to an outside client over loopback, optional Cloudflare tunnel, OAuth 2.1 for clients that cannot send a pasted bearer header | **1.0.13-rc.4** |
 
 ---
 
@@ -268,6 +269,7 @@ Not affiliated with xAI. Based on Apache-2.0 Grok Build source.
 | **1.0-rc.9** | **`1.0.0-rc.9`** | **Meeting Tool v3:** joined Teams notetaker bot, in-page audio tap, read-only meeting Q&A |
 | **1.0-rc.10** | **`1.0.0-rc.10`** | **Teams Join Hardening:** web-join rewrite, protocol guard, honest fallback, GitHub sync preflight |
 | **1.0-rc.12** | **`1.0.0-rc.12`** | **Subagent hardening** + display name **Turbo Build** (CLI still `turbo`) |
+| **1.0.13-rc.4** | **`1.0.13-rc.4`** | **`turbo mcp serve`:** Turbo as an MCP server — loopback + optional tunnel, OAuth 2.1 for ChatGPT Developer mode |
 | **1.0.13-rc.3** | **`1.0.13-rc.3`** | **Codex window isolation** + Spark spawn aliases (`spark`, `codex-spark`) |
 | **1.0.13-rc.2** | **`1.0.13-rc.2`** | **Codex catalog:** GPT-6 Astra (Light→Ultra) + GPT-5.3 Codex Spark as a first-class picker model |
 | **1.0.13-rc.1** | **`1.0.13-rc.1`** | **Upstream sync 1.0.13:** multi-folder (`--add-dir`, `/folder`), `--confine` path list, upstream security ports, Windows + Linux suites green |
@@ -548,6 +550,78 @@ leaked for the life of the process.
 
 ---
 
+## MCP server (`turbo mcp serve`)
+
+Turbo can also act as an MCP **server**, exposing a bounded subset of its own
+file tools to an outside client over Streamable HTTP.
+
+```sh
+turbo mcp serve --root /path/to/project
+```
+
+It binds loopback only, and prints what a client needs:
+
+```text
+Turbo MCP server listening (loopback only)
+  URL:     http://127.0.0.1:52817/3f9c.../mcp
+  Header:  Authorization: Bearer 8a41...
+  OAuth:   http://127.0.0.1:52817/.well-known/oauth-protected-resource/3f9c.../mcp
+  Approve: K7M2PQR9   (a client using OAuth asks for this)
+  Allow:   readonly
+  Root:    /path/to/project
+  Tools:   read_file, list_dir, grep
+```
+
+The URL, the bearer token and the approval code are each credentials, and all
+three change on every start. `--allow` defaults to `readonly`; `edit` is for a
+client you trust to change your code.
+
+### ChatGPT Developer mode (OpenAI custom MCP connector)
+
+ChatGPT's connector discovers a server's OAuth metadata and registers itself —
+it never sends a bearer header you paste in. Turbo implements that flow as an
+OAuth 2.1 resource server: RFC 9728 protected-resource metadata, RFC 8414
+authorization-server metadata, RFC 7591 dynamic client registration, PKCE
+(`S256` only; `plain` is refused), exact redirect-URI matching, and RFC 8707
+audience-bound tokens.
+
+The specification wants the authorization endpoints over HTTPS, so run a tunnel:
+
+```sh
+turbo mcp serve --root /path/to/project --tunnel cloudflare
+```
+
+1. Add the **public** tunnel URL in ChatGPT as a custom MCP connector.
+2. It fetches the metadata, registers itself, and sends you to an approval page.
+3. Enter the `Approve:` code from Turbo's own terminal. Without it nothing is
+   issued, so reaching that page is not enough to obtain a token.
+
+The code is good for five minutes **from the moment the approval page is
+served** — not from when the server started. If it lapses, load the page again:
+that reopens the window, and the same code still works.
+
+> **Status.** This flow is written against the MCP authorization specification
+> and covered by the crate's own wire-level tests. It has **not** yet been
+> exercised against a live ChatGPT connector, so treat a first connection as a
+> test rather than a supported path.
+
+An access token lasts an hour and the client refreshes it. A refresh token is
+replaced on every use, and presenting a spent one is treated as theft: the grant
+it became is revoked, and the event is reported on Turbo's standard error. A
+token is bound to the URL it was issued for, so one minted before the tunnel came
+up is not accepted afterwards, and a token from another server is never accepted.
+
+None of this widens what a client may do. Every call still passes the same
+boundary, in the tier you started, inside the roots you approved. The full
+boundary — path rules, always-refused locations, connection and body caps, and
+troubleshooting — is in the
+[MCP Server guide](crates/codegen/xai-grok-pager/docs/user-guide/32-mcp-server.md).
+
+Any MCP client that *can* send a custom `Authorization: Bearer` header still
+works exactly as before; OAuth is an addition, not a replacement.
+
+---
+
 ## Building from source
 
 Requirements: Rust (`rust-toolchain.toml`), [DotSlash](https://dotslash-cli.com)
@@ -636,6 +710,7 @@ Artifacts ship as `turbo-<version>-<target>.tar.gz` / `.zip` + `SHA256SUMS`.
 | Doc | Content |
 |-----|---------|
 | [User guide](crates/codegen/xai-grok-pager/docs/user-guide/) | Product how-to (CLI is `turbo`) |
+| [MCP Server](crates/codegen/xai-grok-pager/docs/user-guide/32-mcp-server.md) | `turbo mcp serve`: roots, tiers, the boundary, tunnels, and the ChatGPT OAuth flow |
 | [Changelog](./CHANGELOG.md) | RC14 + pedigree table |
 | [Workspace Tree](docs/workspace-tree.md) | Atlas / inject / CLI |
 | [Auto Developer Log](docs/AUTO_DEVELOPER_LOG.md) | Field logging for maintainers |

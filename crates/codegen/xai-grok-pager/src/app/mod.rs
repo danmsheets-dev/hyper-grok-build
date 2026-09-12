@@ -16,6 +16,7 @@ pub mod app_view;
 pub mod browser_cmd;
 pub mod bundle;
 pub mod cli;
+pub(crate) mod codex_quota;
 pub use crate::link_opener;
 /// Off-thread full-file syntax highlight upgrade for edit diffs.
 pub mod edit_highlight_worker;

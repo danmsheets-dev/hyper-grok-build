@@ -64,6 +64,7 @@ pub use model::{
 };
 pub(crate) use model::{TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired};
 pub(crate) use refresh::DiagnosticUploader;
+pub(crate) use storage::read_openai_codex_auth_with_epoch;
 pub use storage::{
     auth_json_path, clear_anthropic_claude_auth, clear_api_key, clear_bedrock_auth,
     clear_github_copilot_auth, clear_kimi_code_auth, clear_openai_codex_auth,

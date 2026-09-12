@@ -10352,12 +10352,16 @@ checksum = "f00a32c3b81b7b254076a65abd5ab2551209146713ba38f73818657e865e9433"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "futures",
  "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
  "oauth2",
  "pastey",
  "pin-project-lite",
+ "rand 0.10.0",
  "reqwest 0.13.4",
  "rmcp-macros",
  "schemars 1.0.4",
@@ -10368,8 +10372,10 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -16319,6 +16325,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-mcp-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "dirs 5.0.1",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "reqwest 0.12.24",
+ "ring",
+ "rmcp",
+ "same-file",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "tower",
+ "tracing",
+ "windows-sys 0.59.0",
+ "xai-grok-config",
+ "xai-grok-sandbox",
+ "xai-grok-tools",
+ "xai-tty-utils",
+]
+
+[[package]]
 name = "xai-grok-meeting-bot"
 version = "0.1.0"
 dependencies = [
@@ -16486,6 +16527,7 @@ dependencies = [
  "xai-grok-extension-api",
  "xai-grok-extension-runtime",
  "xai-grok-markdown",
+ "xai-grok-mcp-server",
  "xai-grok-mermaid",
  "xai-grok-models",
  "xai-grok-pager-pty-harness",

@@ -188,14 +188,9 @@ fn dispatch_cycle_scoped_model(app: &mut AppView, reverse: bool) -> Vec<Effect> 
         });
         return vec![];
     };
-    agent.session.model_switch_pending = true;
-    vec![Effect::SwitchModel {
-        agent_id: id,
-        session_id,
-        model_id,
-        effort: None,
-        prev_model_id: None,
-    }]
+    super::session::lifecycle::request_model_switch(
+        id, agent, session_id, model_id, None, false, None,
+    )
 }
 /// Dispatch an action: mutate state, return effects to execute.
 ///
@@ -1057,14 +1052,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                     }]
                 };
             };
-            agent.session.model_switch_pending = true;
-            vec![Effect::SwitchModel {
-                agent_id: id,
-                session_id,
-                model_id,
-                effort,
-                prev_model_id: None,
-            }]
+            super::session::lifecycle::request_model_switch(
+                id, agent, session_id, model_id, effort, false, None,
+            )
         }
         Action::AnnouncementsHide => {
             let shown_key = crate::views::announcements::first_session_announcement(
@@ -1409,9 +1399,20 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::AgentTypeMismatchAnswered {
             start_new,
+            origin_agent_id,
+            origin_session_id,
+            generation,
             model_id,
             effort,
-        } => dispatch_agent_type_mismatch_answered(app, start_new, model_id, effort),
+        } => dispatch_agent_type_mismatch_answered(
+            app,
+            start_new,
+            origin_agent_id,
+            origin_session_id,
+            generation,
+            model_id,
+            effort,
+        ),
         Action::PersistMemoryFullscreen(fs) => {
             vec![Effect::PersistMemoryFullscreen { fullscreen: fs }]
         }

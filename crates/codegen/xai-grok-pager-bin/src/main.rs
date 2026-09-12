@@ -124,6 +124,13 @@ fn print_serve_startup_info(bind_addr: SocketAddr, secret: &str) {
 const HEADLESS_ENTRYPOINT: &str = "headless";
 /// Initialize simple tracing for non-TUI agent modes.
 fn init_tracing_simple(app_entrypoint: &'static str) {
+    init_tracing_with_writer(app_entrypoint, std::io::stderr);
+}
+/// [`init_tracing_simple`] with its standard error layer writing through `writer`.
+fn init_tracing_with_writer<W>(app_entrypoint: &'static str, writer: W)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     use tracing_subscriber::{EnvFilter, Layer as _, fmt, layer::SubscriberExt as _};
     use xai_grok_telemetry::debug_log::RMCP_SSE_NOISE_TARGET;
     let default_filter = if app_entrypoint == HEADLESS_ENTRYPOINT {
@@ -142,7 +149,7 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
     let fmt_layer = fmt::layer()
         .with_target(false)
         .with_ansi(true)
-        .with_writer(std::io::stderr);
+        .with_writer(writer);
     let registry = tracing_subscriber::registry()
         .with(fmt_layer.with_filter(env_filter))
         .with(xai_grok_telemetry::sampling_log::layer())
@@ -2209,7 +2216,19 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 return Ok(());
             }
             Command::Mcp(mcp_args) => {
-                init_tracing_simple("cli");
+                if matches!(
+                    mcp_args.command,
+                    xai_grok_pager::mcp_cmd::McpCommand::Serve(_)
+                ) {
+                    // Log lines join the server's operator queue, so a standard
+                    // error nobody reads cannot block the server's threads.
+                    init_tracing_with_writer(
+                        "cli",
+                        xai_grok_pager::mcp_serve_cmd::tracing_writer(),
+                    );
+                } else {
+                    init_tracing_simple("cli");
+                }
                 return xai_grok_pager::mcp_cmd::run(mcp_args).await;
             }
             Command::Plugin(plugin_args) => {
@@ -2838,7 +2857,7 @@ async fn signal_leaders_to_relaunch(installed_version: &str, allow_same_version:
                 ),
                 (Ok(leader), Ok(installed)) if leader == installed
             );
-            if !older && !(allow_same_version && equal) {
+            if !(older || (allow_same_version && equal)) {
                 continue;
             }
         }

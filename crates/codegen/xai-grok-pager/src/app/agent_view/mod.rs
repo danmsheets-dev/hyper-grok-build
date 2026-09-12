@@ -936,6 +936,8 @@ pub struct AgentView {
     /// True when CLI/env locked local workspace at startup for this session.
     #[cfg(feature = "local-workspace")]
     pub workspace_mode_cli_locked: bool,
+    /// OpenAI Codex allowance presentation for this confirmed model binding.
+    pub codex_quota: Option<crate::app::codex_quota::CodexQuotaDisplay>,
     /// Mocked credit balance for the status bar indicator.
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
     /// Auto top-up rule paired with `credit_balance` for the prompt warning.
@@ -1829,10 +1831,19 @@ fn translate_local_submit(
             }
             InputOutcome::Action(Action::OpenUrl(action_id.to_string()))
         }
-        LocalQuestionKind::AgentTypeMismatch { model_id, effort } => {
+        LocalQuestionKind::AgentTypeMismatch {
+            origin_agent_id,
+            origin_session_id,
+            generation,
+            model_id,
+            effort,
+        } => {
             let start_new = *idx == 0;
             InputOutcome::Action(Action::AgentTypeMismatchAnswered {
                 start_new,
+                origin_agent_id,
+                origin_session_id,
+                generation,
                 model_id: model_id.clone(),
                 effort,
             })
@@ -2617,6 +2628,10 @@ pub(crate) mod test_fixtures {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
@@ -2680,6 +2695,10 @@ pub(crate) mod test_fixtures {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                model_switch_generation: 0,
+                pending_model_switch: None,
+                queued_model_switch: None,
+                pending_model_switch_confirmation: None,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 bg_tasks: std::collections::BTreeMap::new(),
@@ -3503,6 +3522,10 @@ pub(crate) fn test_agent_view(session_id: Option<&str>, cwd: std::path::PathBuf)
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_generation: 0,
+            pending_model_switch: None,
+            queued_model_switch: None,
+            pending_model_switch_confirmation: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

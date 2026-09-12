@@ -64,7 +64,9 @@ pub struct UsageInfoContext {
     pub chat_kind: bool,
     /// Remote-settings kill switch: link out instead of showing billing.
     pub billing_redirect_url: Option<String>,
-    /// Plan name for the allowance header (e.g. "SuperGrok").
+    /// Provider selected by the confirmed canonical main model.
+    pub allowance_provider: crate::app::codex_quota::AllowanceProvider,
+    /// Plan name for the xAI allowance header (e.g. "SuperGrok").
     pub subscription_tier: Option<String>,
 }
 
@@ -83,6 +85,7 @@ pub struct UsageInfoModalState {
     pub session_error: Option<String>,
     /// Pre-formatted session token/cost summary (`session_usage_block_text`).
     pub session_usage_text: Option<String>,
+    pub codex_quota: Option<crate::app::codex_quota::CodexQuotaDisplay>,
     pub billing_loading: bool,
     pub billing_error: Option<String>,
     /// Fetch generation stamped at open; results from an earlier open (same
@@ -105,6 +108,7 @@ impl UsageInfoModalState {
             session_text: None,
             session_error: None,
             session_usage_text: None,
+            codex_quota: None,
             billing_loading: false,
             billing_error: None,
             fetch_nonce: 0,
@@ -393,20 +397,48 @@ fn usage_limit_lines(
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    if state.ctx.chat_kind {
-        // Gateway chat sessions have no Build coding credits to show.
-    } else if !state.ctx.usage_visible {
-        lines.push(muted_line(theme, "Usage limits are managed by your team."));
-    } else if let Some(url) = &state.ctx.billing_redirect_url {
-        lines.push(plain(theme, format!("Please check your usage on {url}")));
-    } else if let Some(bal) = balance {
-        lines.extend(allowance_lines(state, bal, theme));
-    } else if let Some(error) = &state.billing_error {
-        lines.push(muted_line(theme, format!("Couldn't load usage: {error}")));
-    } else if state.billing_loading {
-        lines.push(muted_line(theme, "Loading usage\u{2026}"));
-    } else {
-        lines.push(muted_line(theme, "No billing data available."));
+    match &state.ctx.allowance_provider {
+        crate::app::codex_quota::AllowanceProvider::Codex => {
+            let text = state
+                .codex_quota
+                .as_ref()
+                .map(crate::app::codex_quota::display_text)
+                .unwrap_or_else(|| "OpenAI Codex allowance\nLoading usage\u{2026}".to_string());
+            for (index, row) in text.lines().enumerate() {
+                if index == 0 {
+                    lines.push(Line::styled(row.to_string(), header_style(theme)));
+                } else {
+                    lines.push(plain(theme, row));
+                }
+            }
+        }
+        crate::app::codex_quota::AllowanceProvider::Unsupported(provider) => {
+            lines.push(Line::styled(
+                format!("{provider} allowance"),
+                header_style(theme),
+            ));
+            lines.push(muted_line(
+                theme,
+                "Usage limits are unavailable for this provider.",
+            ));
+        }
+        crate::app::codex_quota::AllowanceProvider::Xai => {
+            if state.ctx.chat_kind {
+                // Gateway chat sessions have no Build coding credits to show.
+            } else if !state.ctx.usage_visible {
+                lines.push(muted_line(theme, "xAI usage limits are managed by your team."));
+            } else if let Some(url) = &state.ctx.billing_redirect_url {
+                lines.push(plain(theme, format!("Check xAI usage on {url}")));
+            } else if let Some(bal) = balance {
+                lines.extend(allowance_lines(state, bal, theme));
+            } else if let Some(error) = &state.billing_error {
+                lines.push(muted_line(theme, format!("Couldn't load xAI usage: {error}")));
+            } else if state.billing_loading {
+                lines.push(muted_line(theme, "Loading usage (xAI)\u{2026}"));
+            } else {
+                lines.push(muted_line(theme, "No xAI billing data available."));
+            }
+        }
     }
 
     if let Some(usage_text) = &state.session_usage_text {
@@ -588,6 +620,7 @@ mod tests {
                 usage_visible: true,
                 chat_kind: false,
                 billing_redirect_url: None,
+                allowance_provider: crate::app::codex_quota::AllowanceProvider::Xai,
                 subscription_tier: Some("SuperGrok".to_string()),
             },
         )

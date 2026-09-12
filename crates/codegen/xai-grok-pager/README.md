@@ -60,6 +60,7 @@ src/
 ## Docs
 
 - [Terminal Support & Troubleshooting](docs/user-guide/21-terminal-support.md) — tmux/SSH truecolor, clipboard, mouse, diagnostics, `/doctor`
+- [MCP Server (`turbo mcp serve`)](docs/user-guide/32-mcp-server.md) — serving Turbo's file tools to an outside MCP client: roots, tiers, tunnels, and the ChatGPT Developer mode OAuth flow
 - [Hooks & Plugins Guide](docs/hooks-and-plugins.md) — managing hooks, plugins, and marketplace sources
 - [Custom Hooks Guide](docs/custom-hooks.md) — creating, configuring, and writing your own hooks
 - [Hook Examples](../xai-grok-hooks/examples/README.md) — sample hooks for common workflows

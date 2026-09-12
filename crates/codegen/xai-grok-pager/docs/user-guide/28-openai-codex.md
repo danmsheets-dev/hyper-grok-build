@@ -177,6 +177,37 @@ Running `grok codex` signed out starts the browser login automatically
 (interactive terminals); selecting an `openai-codex/*` model without a
 credential shows the `/login openai` hint.
 
+### Subscription usage
+
+`/usage` reads the selected main model's provider. For
+`openai-codex/*` models (and legacy `codex:` session IDs), the **Usage limit**
+tab shows OpenAI Codex subscription buckets, their server-reported primary and
+secondary window durations, reset times, and optional credits. Additional
+buckets such as Spark are shown rather than folded into the main allowance.
+Unknown percentages or reset times remain labeled as unknown; the UI does not
+estimate remaining messages or tokens. A credits balance is displayed exactly
+as OpenAI reports it and is not assumed to be US dollars.
+
+The context and session tabs remain session-scoped. Codex allowance itself is
+account-scoped, so it is also available before a session starts when the
+welcome model is Codex. `/usage` works in both the full TUI and minimal mode.
+Transient refresh failures may show same-account cached data with its age.
+Signing out, signing back in, changing accounts, rebinding a session, or
+confirming a model switch invalidates an in-flight presentation.
+
+Grok/xAI billing and OpenAI Codex allowance are independent. Selecting a Codex
+model never falls back to a SuperGrok percentage, team-account gates do not hide
+Codex allowance, and `/usage manage` does not open Grok billing for Codex.
+Manage the subscription in the official ChatGPT account UI.
+
+Routing policy: the welcome screen uses `AppView.models.current`; an agent
+screen uses that agent's confirmed `AgentSession.models.current`. A pending
+model switch keeps the old provider until the shell confirms it, then the new
+provider takes effect immediately. Native `openai-codex/` and legacy `codex:`
+IDs route to Codex; xAI/Grok models route to existing xAI billing; other
+providers explicitly report that usage limits are unavailable and never reuse
+Grok quota as a fallback.
+
 ---
 
 ## Migration notes (app-server removal)

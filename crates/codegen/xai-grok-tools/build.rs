@@ -295,10 +295,8 @@ fn bundle_rg() -> Result<(), Box<dyn std::error::Error>> {
     // vendor filename instead of scanning `rg-*` (F58).
     println!("cargo:rustc-env=GROK_TOOLS_RG_VER={}", RG_VER);
     if path_override.is_none() && !is_release {
-        if let Ok(target) = env::var("TARGET") {
-            if !target.is_empty() {
-                println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET={target}");
-            }
+        if let Ok(target) = env::var("TARGET") && !target.is_empty() {
+            println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET={target}");
         }
         return Ok(());
     }
@@ -311,10 +309,8 @@ fn bundle_rg() -> Result<(), Box<dyn std::error::Error>> {
     // GROK_TOOLS_BUNDLE_RG_PATH still bundles regardless of target.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "windows" && path_override.is_none() {
-        if let Ok(target) = env::var("TARGET") {
-            if !target.is_empty() {
-                println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET={target}");
-            }
+        if let Ok(target) = env::var("TARGET") && !target.is_empty() {
+            println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET={target}");
         }
         return Ok(());
     }

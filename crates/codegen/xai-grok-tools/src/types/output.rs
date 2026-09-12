@@ -15,6 +15,103 @@ pub fn line_diff(old: &str, new: &str) -> (i64, i64) {
     }
     (added, removed)
 }
+/// How long [`line_diff_bounded`] searches for the smallest diff.
+pub const LINE_DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Most lines, both sides together, that [`line_diff_bounded`] hands to the diff
+/// algorithm, whose memory grows with them.
+pub const MAX_DIFFED_LINES: usize = 500_000;
+/// Line counts from [`line_diff_bounded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineDiffCount {
+    pub added: i64,
+    pub removed: i64,
+    /// Whether these are the smallest diff's counts. When not, they are higher.
+    pub exact: bool,
+}
+/// Lines in `text` as [`line_diff`] counts them: a `\n`, a `\r\n` and a lone
+/// `\r` each end one, and text after the last ending is one more.
+pub fn diff_line_count(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let endings = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| {
+            byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
+        })
+        .count();
+    let unended = bytes
+        .last()
+        .is_some_and(|&last| last != b'\n' && last != b'\r');
+    endings + usize::from(unended)
+}
+/// Whether a line, as [`line_diff`] counts lines, ends just before byte `at` of
+/// `text`, or `at` is its start.
+fn line_ends_before(text: &[u8], at: usize) -> bool {
+    at == 0
+        || match text[at - 1] {
+            b'\n' => true,
+            b'\r' => text.get(at) != Some(&b'\n'),
+            _ => false,
+        }
+}
+/// [`line_diff`] bounded in time and memory, for text an untrusted client
+/// supplies. The whole lines the two texts share at the start and the end are
+/// set aside first. What is left is counted as all removed and all added when it
+/// holds more than [`MAX_DIFFED_LINES`] lines, and is otherwise diffed for at
+/// most [`LINE_DIFF_TIMEOUT`], after which the diff approximates. Either way the
+/// counts can come out higher than the smallest diff's, never lower, and `exact`
+/// says whether they did not. Lines are counted the way the diff counts them.
+pub fn line_diff_bounded(old: &str, new: &str) -> LineDiffCount {
+    let (old, new) = without_common_ends(old, new);
+    let old_lines = diff_line_count(old);
+    let new_lines = diff_line_count(new);
+    if old_lines == 0 || new_lines == 0 || old_lines + new_lines > MAX_DIFFED_LINES {
+        return LineDiffCount {
+            added: new_lines as i64,
+            removed: old_lines as i64,
+            exact: old_lines == 0 || new_lines == 0,
+        };
+    }
+    let started = std::time::Instant::now();
+    let mut added = 0i64;
+    let mut removed = 0i64;
+    for change in similar::TextDiff::configure()
+        .timeout(LINE_DIFF_TIMEOUT)
+        .diff_lines(old, new)
+        .iter_all_changes()
+    {
+        match change.tag() {
+            similar::ChangeTag::Insert => added += 1,
+            similar::ChangeTag::Delete => removed += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    LineDiffCount {
+        added,
+        removed,
+        exact: started.elapsed() < LINE_DIFF_TIMEOUT,
+    }
+}
+/// `old` and `new` without the whole lines, as [`line_diff`] counts lines, they
+/// share at the start and the end.
+fn without_common_ends<'a>(old: &'a str, new: &'a str) -> (&'a str, &'a str) {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let mut start = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    while start > 0 && !(line_ends_before(a, start) && line_ends_before(b, start)) {
+        start -= 1;
+    }
+    let (a, b) = (&a[start..], &b[start..]);
+    let mut end = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    while end > 0 && !(line_ends_before(a, a.len() - end) && line_ends_before(b, b.len() - end)) {
+        end -= 1;
+    }
+    (&old[start..old.len() - end], &new[start..new.len() - end])
+}
 /// Wrapper for [`ToolOutput::Text`] so it can round-trip through
 /// `#[serde(tag = "type")]` (internally-tagged enums require struct/map
 /// payloads, not bare primitives).
@@ -1460,6 +1557,102 @@ mod tests {
     use serde_json::json;
     use xai_tool_types::KillTaskResult;
     use xai_tool_types::TaskOutputResult;
+    #[test]
+    fn line_diff_bounded_counts_a_small_change_exactly() {
+        let old = "a\nb\nc\nd\n";
+        let new = "a\nB\nc\nd\ne\n";
+        assert_eq!(
+            line_diff_bounded(old, new),
+            LineDiffCount {
+                added: 2,
+                removed: 1,
+                exact: true
+            }
+        );
+        assert_eq!(line_diff(old, new), (2, 1));
+        assert_eq!(
+            line_diff_bounded("same\n", "same\n"),
+            LineDiffCount {
+                added: 0,
+                removed: 0,
+                exact: true
+            }
+        );
+    }
+    #[test]
+    fn line_diff_bounded_never_undercounts_what_it_cannot_afford() {
+        // Too many lines to diff: everything between the shared ends counts.
+        let shared = "same\n".repeat(10);
+        let middle =
+            |prefix: &str| -> String { (0..300_000).map(|i| format!("{prefix}{i}\n")).collect() };
+        let old = format!("{shared}{}{shared}", middle("a"));
+        let new = format!("{shared}{}{shared}", middle("b"));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            line_diff_bounded(&old, &new),
+            LineDiffCount {
+                added: 300_000,
+                removed: 300_000,
+                exact: false
+            }
+        );
+        assert!(
+            started.elapsed() < LINE_DIFF_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+        // Few enough lines to diff, but too different to finish in time.
+        let old: String = (0..60_000).map(|i| format!("a{i}\n")).collect();
+        let new: String = (0..60_000).map(|i| format!("b{i}\n")).collect();
+        let started = std::time::Instant::now();
+        let count = line_diff_bounded(&old, &new);
+        assert_eq!((count.added, count.removed), (60_000, 60_000));
+        assert!(
+            started.elapsed() < LINE_DIFF_TIMEOUT * 10,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+    #[test]
+    fn line_diff_bounded_counts_lines_the_way_the_diff_does() {
+        // A lone carriage return ends a line for the diff, so it ends one for the
+        // bound too; otherwise text with old Mac line endings counts as one line.
+        let samples = [
+            ("", "x\rx\rx\r"),
+            ("head\n", "head\nx\rx\r"),
+            ("a\r\nb\r\n", "a\r\nc\r\n"),
+            ("a\rb\rc", "a\rB\rc"),
+            ("one\ntwo\r\nthree\rfour", "one\nTWO\r\nthree\rfour\r"),
+            ("same\r", "same\r\n"),
+            ("p\r\nX", "q\r\nX"),
+        ];
+        for (old, new) in samples {
+            let (added, removed) = line_diff(old, new);
+            let bounded = line_diff_bounded(old, new);
+            assert_eq!(
+                (bounded.added, bounded.removed, bounded.exact),
+                (added, removed, true),
+                "{old:?} -> {new:?}"
+            );
+        }
+        assert_eq!(diff_line_count("a\r\nb"), 2);
+        assert_eq!(diff_line_count("a\rb\r"), 2);
+        assert_eq!(diff_line_count("\r\n"), 1);
+        assert_eq!(diff_line_count(""), 0);
+    }
+    #[test]
+    fn line_diff_bounded_counts_lone_carriage_returns_it_cannot_afford_to_diff() {
+        let old = "a\r".repeat(300_000);
+        let new = "b\r".repeat(300_000);
+        assert_eq!(
+            line_diff_bounded(&old, &new),
+            LineDiffCount {
+                added: 300_000,
+                removed: 300_000,
+                exact: false
+            }
+        );
+    }
     /// Serialize a ToolOutput to JSON value
     fn to_json(output: ToolOutput) -> serde_json::Value {
         serde_json::to_value(&output).unwrap()
