@@ -8,6 +8,7 @@ limit, and public-fork LFS uploads are blocked on GitHub).
 
 | Wire version | Release | Asset |
 | --- | --- | --- |
+| `1.0.13-rc.4` | [v1.0.13-rc.4](https://github.com/danmsheets-dev/turbo-grok-build/releases/tag/v1.0.13-rc.4) | `turbo-1.0.13-rc.4-x86_64-pc-windows-msvc.zip` |
 | `1.0.13-rc.3` | [v1.0.13-rc.3](https://github.com/danmsheets-dev/turbo-grok-build/releases/tag/v1.0.13-rc.3) | `turbo-1.0.13-rc.3-x86_64-pc-windows-msvc.zip` |
 | `1.0.13-rc.2` | [v1.0.13-rc.2](https://github.com/danmsheets-dev/turbo-grok-build/releases/tag/v1.0.13-rc.2) | `turbo-1.0.13-rc.2-x86_64-pc-windows-msvc.zip` |
 | `1.0.13-rc.1` | [v1.0.13-rc.1](https://github.com/danmsheets-dev/turbo-grok-build/releases/tag/v1.0.13-rc.1) | `turbo-1.0.13-rc.1-x86_64-pc-windows-msvc.zip` |
